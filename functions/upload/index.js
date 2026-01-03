@@ -12,6 +12,9 @@ import { HuggingFaceAPI } from "../utils/huggingfaceAPI";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
 
+// 导入七牛云上传功能
+import { uploadFileToQiniu, uploadLargeFileToQiniu } from "./qiniuUpload";
+
 
 export async function onRequest(context) {  // Contents of context object
     const { request, env, params, waitUntil, next, data } = context;
@@ -111,6 +114,10 @@ async function processFileUpload(context, formdata = null) {
             break;
         case 'external':
             uploadChannel = 'External';
+            break;
+        // 添加七牛云渠道支持
+        case 'qiniu':
+            uploadChannel = 'Qiniu';
             break;
         default:
             uploadChannel = 'TelegramNew';
@@ -216,6 +223,14 @@ async function processFileUpload(context, formdata = null) {
         // --------------------外链渠道----------------------
         const res = await uploadFileToExternal(context, fullId, metadata, returnLink);
         return res;
+    } else if (uploadChannel === 'Qiniu') {
+        // --------------------七牛云渠道----------------------
+        const res = await uploadFileToQiniu(context, fullId, metadata, returnLink);
+        if (res.status === 200 || !autoRetry) {
+            return res;
+        } else {
+            err = await res.text();
+        }
     } else {
         // ----------------Telegram New 渠道-------------------
         const res = await uploadFileToTelegram(context, fullId, metadata, fileExt, fileName, fileType, returnLink);
@@ -755,7 +770,7 @@ async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, 
     const { env, url, formdata } = context;
 
     // 渠道列表（Discord 因为有 10MB 限制，放在最后尝试）
-    const channelList = ['CloudflareR2', 'TelegramNew', 'S3', 'HuggingFace', 'Discord'];
+    const channelList = ['CloudflareR2', 'TelegramNew', 'S3', 'HuggingFace', 'Qiniu', 'Discord'];
     const errMessages = {};
     errMessages[uploadChannel] = 'Error: ' + uploadChannel + err;
 
@@ -770,6 +785,8 @@ async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, 
         retryRes = await uploadFileToS3(context, fullId, metadata, returnLink);
     } else if (uploadChannel === 'HuggingFace') {
         retryRes = await uploadFileToHuggingFace(context, fullId, metadata, returnLink);
+    } else if (uploadChannel === 'Qiniu') {
+        retryRes = await uploadFileToQiniu(context, fullId, metadata, returnLink);
     } else if (uploadChannel === 'Discord') {
         retryRes = await uploadFileToDiscord(context, fullId, metadata, returnLink);
     }
@@ -793,6 +810,8 @@ async function tryRetry(err, context, uploadChannel, fullId, metadata, fileExt, 
                 res = await uploadFileToS3(context, fullId, metadata, returnLink);
             } else if (channelList[i] === 'HuggingFace') {
                 res = await uploadFileToHuggingFace(context, fullId, metadata, returnLink);
+            } else if (channelList[i] === 'Qiniu') {
+                res = await uploadFileToQiniu(context, fullId, metadata, returnLink);
             } else if (channelList[i] === 'Discord') {
                 res = await uploadFileToDiscord(context, fullId, metadata, returnLink);
             }
