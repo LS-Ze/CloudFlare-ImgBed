@@ -33,12 +33,17 @@ export async function onRequest(context) {  // Contents of context object
         return UnauthorizedResponse('Unauthorized');
     }
 
-    // 获得上传IP
+    // 获得上传IP - 使用改进的getUploadIp函数
     const uploadIp = getUploadIp(request);
-    // 判断上传ip是否被封禁
-    const isBlockedIp = await isBlockedUploadIp(env, uploadIp);
-    if (isBlockedIp) {
-        return createResponse('Error: Your IP is blocked', { status: 403 });
+    
+    // 判断上传ip是否被封禁（增强错误处理）
+    if (uploadIp !== 'unknown') {
+        const isBlockedIp = await isBlockedUploadIp(env, uploadIp);
+        if (isBlockedIp) {
+            return createResponse('Error: Your IP is blocked', { status: 403 });
+        }
+    } else {
+        console.warn('Failed to get client IP address, skipping IP block check');
     }
 
     // 检查是否为清理请求
@@ -85,7 +90,7 @@ async function processFileUpload(context, formdata = null) {
     // 获得上传渠道
     const urlParamUploadChannel = url.searchParams.get('uploadChannel');
 
-    // 获取IP地址
+    // 获取IP地址 - 使用改进的方法
     const uploadIp = getUploadIp(request);
     const ipAddress = await getIPAddress(uploadIp);
 
