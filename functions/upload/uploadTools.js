@@ -191,23 +191,72 @@ export async function endUpload(context, fileId, metadata) {
     await addFileToIndex(context, fileId, metadata);
 }
 
-// 从 request 中解析 ip 地址
+// 从 request 中解析 ip 地址 - 改进版本
 export function getUploadIp(request) {
-    const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for") || request.headers.get("x-client-ip") || request.headers.get("x-host") || request.headers.get("x-originating-ip") || request.headers.get("x-cluster-client-ip") || request.headers.get("forwarded-for") || request.headers.get("forwarded") || request.headers.get("via") || request.headers.get("requester") || request.headers.get("true-client-ip") || request.headers.get("client-ip") || request.headers.get("x-remote-ip") || request.headers.get("x-originating-ip") || request.headers.get("fastly-client-ip") || request.headers.get("akamai-origin-hop") || request.headers.get("x-remote-addr") || request.headers.get("x-remote-host") || request.headers.get("x-client-ips")
-
-    if (!ip) {
-        return null;
+    try {
+        // 1. 优先使用Cloudflare提供的cf对象（推荐方法）
+        if (request.cf && request.cf.clientIp) {
+            console.log(`Using request.cf.clientIp: ${request.cf.clientIp}`);
+            return request.cf.clientIp;
+        }
+        
+        // 2. 使用CF-Connecting-IP头（次优选择）
+        const cfConnectingIp = request.headers.get('CF-Connecting-IP');
+        if (cfConnectingIp) {
+            console.log(`Using CF-Connecting-IP: ${cfConnectingIp}`);
+            return cfConnectingIp;
+        }
+        
+        // 3. 使用X-Forwarded-For头（需要解析第一个IP）
+        const xForwardedFor = request.headers.get('X-Forwarded-For');
+        if (xForwardedFor) {
+            const clientIp = xForwardedFor.split(',')[0].trim();
+            console.log(`Using X-Forwarded-For: ${clientIp}`);
+            return clientIp;
+        }
+        
+        // 4. 尝试其他常见的IP头
+        const ipHeaders = [
+            'x-real-ip', 'x-client-ip', 'x-host', 'x-originating-ip',
+            'x-cluster-client-ip', 'forwarded-for', 'forwarded', 'via',
+            'requester', 'true-client-ip', 'client-ip', 'x-remote-ip',
+            'fastly-client-ip', 'akamai-origin-hop', 'x-remote-addr',
+            'x-remote-host', 'x-client-ips'
+        ];
+        
+        for (const header of ipHeaders) {
+            const ip = request.headers.get(header);
+            if (ip) {
+                console.log(`Using ${header}: ${ip}`);
+                return ip.split(',')[0].trim();
+            }
+        }
+        
+        // 5. 最后尝试使用remoteAddress（可能不是真实IP）
+        if (request.remoteAddress) {
+            console.log(`Using remoteAddress: ${request.remoteAddress}`);
+            return request.remoteAddress;
+        }
+        
+        // 6. 所有方法都失败时返回unknown
+        console.warn('Failed to get client IP address using all methods');
+        return 'unknown';
+        
+    } catch (error) {
+        console.error('Error getting upload IP:', error);
+        return 'unknown';
     }
-
-    // 处理多个IP地址的情况
-    const ips = ip.split(',').map(i => i.trim());
-
-    return ips[0]; // 返回第一个IP地址
 }
 
 // 检查上传IP是否被封禁
 export async function isBlockedUploadIp(env, uploadIp) {
     try {
+        // 如果IP是unknown，不阻止上传
+        if (uploadIp === 'unknown') {
+            console.warn('IP is unknown, skipping block check');
+            return false;
+        }
+
         const db = getDatabase(env);
 
         let list = await db.get("manage@blockipList");
@@ -217,10 +266,14 @@ export async function isBlockedUploadIp(env, uploadIp) {
             list = list.split(",");
         }
 
-        return list.includes(uploadIp);
+        const isBlocked = list.includes(uploadIp);
+        if (isBlocked) {
+            console.log(`IP ${uploadIp} is blocked`);
+        }
+        return isBlocked;
     } catch (error) {
         console.error('Failed to check blocked IP:', error);
-        // 如果数据库未配置，默认不阻止任何IP
+        // 如果数据库未配置或出现错误，默认不阻止任何IP
         return false;
     }
 }
