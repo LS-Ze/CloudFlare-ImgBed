@@ -194,6 +194,12 @@ export async function endUpload(context, fileId, metadata) {
 // 从 request 中解析 ip 地址 - 改进版本
 export function getUploadIp(request) {
     try {
+        // 1. 优先使用EdgeOne提供的EO-Connecting-IP头
+        const eoConnectingIp = request.headers.get('EO-Connecting-IP');
+        if (eoConnectingIp) {
+            console.log(`Using EO-Connecting-IP: ${eoConnectingIp}`);
+            return eoConnectingIp;
+        }
         // 1. 优先使用Cloudflare提供的cf对象（推荐方法）
         if (request.cf && request.cf.clientIp) {
             console.log(`Using request.cf.clientIp: ${request.cf.clientIp}`);
