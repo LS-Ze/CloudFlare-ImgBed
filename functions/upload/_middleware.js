@@ -1,56 +1,38 @@
 import { errorHandling, telemetryData, checkDatabaseConfig } from '../utils/middleware';
 
-// 环境配置
-const ENV = {
-    isProduction: process.env.NODE_ENV === 'production',
-    allowedOrigins: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['*']
-};
-
-// 增强的CORS配置
-const corsHeaders = {
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-CSRF-Token',
-    'Access-Control-Expose-Headers': 'Content-Length, X-Custom-Header, X-Request-ID',
-    'Access-Control-Max-Age': '86400',
-    'Vary': 'Origin'
-};
-
-// 安全响应头
-const securityHeaders = {
-    'X-Frame-Options': 'DENY',
-    'X-XSS-Protection': '1; mode=block',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'X-DNS-Prefetch-Control': 'on',
-    'Strict-Transport-Security': 'max-age=63072000; includeSubDomains; preload'
-};
-
-// 生产环境额外的安全头
-if (ENV.isProduction) {
-    securityHeaders['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'none'; object-src 'none';";
-}
-
 /**
  * 处理CORS和预检请求
  */
 async function handleCORS(context) {
-    const request = context.request;
+    const { request, env } = context;
     const response = await context.next();
     
     // 复制响应头
     const newHeaders = new Headers(response.headers);
     
+    // 获取环境配置
+    const allowedOrigins = env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(',') : ['*'];
+    const isProduction = env.NODE_ENV === 'production';
+    
     // 处理预检请求
     if (request.method === 'OPTIONS') {
         // 处理允许的来源
         const origin = request.headers.get('Origin');
-        if (origin && (ENV.allowedOrigins.includes('*') || ENV.allowedOrigins.includes(origin))) {
+        if (origin && (allowedOrigins.includes('*') || allowedOrigins.includes(origin))) {
             newHeaders.set('Access-Control-Allow-Origin', origin);
         } else {
-            newHeaders.set('Access-Control-Allow-Origin', ENV.allowedOrigins[0] || '*');
+            newHeaders.set('Access-Control-Allow-Origin', allowedOrigins[0] || '*');
         }
         
         // 添加CORS头
+        const corsHeaders = {
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-CSRF-Token',
+            'Access-Control-Expose-Headers': 'Content-Length, X-Custom-Header, X-Request-ID',
+            'Access-Control-Max-Age': '86400',
+            'Vary': 'Origin'
+        };
+        
         Object.entries(corsHeaders).forEach(([key, value]) => {
             newHeaders.set(key, value);
         });
@@ -64,12 +46,26 @@ async function handleCORS(context) {
     // 处理普通请求的CORS
     const origin = request.headers.get('Origin');
     if (origin) {
-        if (ENV.allowedOrigins.includes('*') || ENV.allowedOrigins.includes(origin)) {
+        if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
             newHeaders.set('Access-Control-Allow-Origin', origin);
         }
     }
     
     // 添加安全头
+    const securityHeaders = {
+        'X-Frame-Options': 'DENY',
+        'X-XSS-Protection': '1; mode=block',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'X-DNS-Prefetch-Control': 'on',
+        'Strict-Transport-Security': 'max-age=63072000; includeSubDomains; preload'
+    };
+    
+    // 生产环境额外的安全头
+    if (isProduction) {
+        securityHeaders['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'none'; object-src 'none';";
+    }
+    
     Object.entries(securityHeaders).forEach(([key, value]) => {
         newHeaders.set(key, value);
     });
@@ -144,7 +140,8 @@ async function rateLimiting(context) {
     const { env, request } = context;
     
     // 开发环境跳过速率限制
-    if (!ENV.isProduction) {
+    const isProduction = env.NODE_ENV === 'production';
+    if (!isProduction) {
         return context.next();
     }
     
