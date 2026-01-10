@@ -3,6 +3,28 @@ import { purgeCFCache } from "../utils/purgeCache";
 import { addFileToIndex } from "../utils/indexManager.js";
 import { getDatabase } from '../utils/databaseAdapter.js';
 
+// 缓存配置
+const CACHE_CONFIG = {
+    IP_GEOLOCATION: { ttl: 24 * 60 * 60, maxSize: 1000 }, // 24小时缓存，最多1000个IP
+    SECURITY_CONFIG: { ttl: 5 * 60, maxSize: 1 }, // 5分钟缓存
+    MODERATION_RESULTS: { ttl: 1 * 60, maxSize: 1000 } // 1分钟缓存，最多1000个URL
+};
+
+// 内存缓存
+const memoryCache = new Map();
+
+// 统一错误类
+export class WorkerError extends Error {
+    constructor(message, code = 'INTERNAL_ERROR', status = 500, details = {}) {
+        super(message);
+        this.name = 'WorkerError';
+        this.code = code;
+        this.status = status;
+        this.details = details;
+        this.timestamp = Date.now();
+    }
+}
+
 // 统一的响应创建函数
 export function createResponse(body, options = {}) {
     const defaultHeaders = {
@@ -31,8 +53,30 @@ export function generateShortId(length = 8) {
     return result;
 }
 
+// 使用更安全的ID生成算法
+export function generateSecureId(length = 12) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const array = new Uint8Array(length);
+    crypto.getRandomValues(array);
+    
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars[array[i] % chars.length];
+    }
+    
+    return result;
+}
+
 // 获取IP地址
 export async function getIPAddress(ip) {
+    if (!ip) return '未知';
+    
+    // 尝试从缓存获取
+    const cachedAddress = cacheGet('IP_GEOLOCATION', ip);
+    if (cachedAddress) {
+        return cachedAddress;
+    }
+
     let address = '未知';
     try {
         const ipInfo = await fetch(`https://apimobile.meituan.com/locate/v2/ip/loc?rgeo=true&ip=${ip}`);
@@ -54,6 +98,9 @@ export async function getIPAddress(ip) {
                     addressData.data.province,
                     addressData.data.country
                 ].filter(Boolean).join(', ');
+                
+                // 缓存结果
+                cacheSet('IP_GEOLOCATION', ip, address);
             }
         }
     } catch (error) {
@@ -64,6 +111,8 @@ export async function getIPAddress(ip) {
 
 // 处理文件名中的特殊字符
 export function sanitizeFileName(fileName) {
+    if (!fileName) return 'unknown_file';
+    
     fileName = decodeURIComponent(fileName);
     fileName = fileName.split('/').pop();
 
@@ -73,12 +122,26 @@ export function sanitizeFileName(fileName) {
 
 // 检查文件扩展名是否有效
 export function isExtValid(fileExt) {
-    return ['jpeg', 'jpg', 'png', 'gif', 'webp',
+    if (!fileExt) return false;
+    
+    const validExtensions = new Set([
+        'jpeg', 'jpg', 'png', 'gif', 'webp',
         'mp4', 'mp3', 'ogg',
-        'mp3', 'wav', 'flac', 'aac', 'opus',
+        'wav', 'flac', 'aac', 'opus',
         'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'pdf',
-        'txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'ts', 'go', 'java', 'php', 'py', 'rb', 'sh', 'bat', 'cmd', 'ps1', 'psm1', 'psd', 'ai', 'sketch', 'fig', 'svg', 'eps', 'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'apk', 'exe', 'msi', 'dmg', 'iso', 'torrent', 'webp', 'ico', 'svg', 'ttf', 'otf', 'woff', 'woff2', 'eot', 'apk', 'crx', 'xpi', 'deb', 'rpm', 'jar', 'war', 'ear', 'img', 'iso', 'vdi', 'ova', 'ovf', 'qcow2', 'vmdk', 'vhd', 'vhdx', 'pvm', 'dsk', 'hdd', 'bin', 'cue', 'mds', 'mdf', 'nrg', 'ccd', 'cif', 'c2d', 'daa', 'b6t', 'b5t', 'bwt', 'isz', 'isz', 'cdi', 'flp', 'uif', 'xdi', 'sdi'
-    ].includes(fileExt);
+        'txt', 'md', 'json', 'xml', 'html', 'css', 'js', 'ts', 
+        'go', 'java', 'php', 'py', 'rb', 'sh', 'bat', 'cmd', 'ps1', 'psm1',
+        'psd', 'ai', 'sketch', 'fig', 'svg', 'eps',
+        'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz',
+        'apk', 'exe', 'msi', 'dmg', 'iso', 'torrent',
+        'ico', 'ttf', 'otf', 'woff', 'woff2', 'eot',
+        'crx', 'xpi', 'deb', 'rpm', 'jar', 'war', 'ear',
+        'img', 'vdi', 'ova', 'ovf', 'qcow2', 'vmdk', 'vhd', 'vhdx', 'pvm', 'dsk', 'hdd',
+        'bin', 'cue', 'mds', 'mdf', 'nrg', 'ccd', 'cif', 'c2d', 'daa', 'b6t', 'b5t', 'bwt', 
+        'isz', 'cdi', 'flp', 'uif', 'xdi', 'sdi'
+    ]);
+
+    return validExtensions.has(fileExt.toLowerCase());
 }
 
 /**
@@ -92,41 +155,61 @@ export function isExtValid(fileExt) {
  */
 export async function moderateContent(env, url) {
     try {
-        const securityConfig = await fetchSecurityConfig(env);
+        // 尝试从缓存获取
+        const cachedResult = cacheGet('MODERATION_RESULTS', url);
+        if (cachedResult) {
+            return { ...cachedResult, fromCache: true };
+        }
+
+        const securityConfig = await fetchSecurityConfigWithCache(env);
         const uploadModerate = securityConfig.upload.moderate;
 
         // 检查是否启用审查
         if (!uploadModerate || !uploadModerate.enabled) {
-            return {
+            const result = {
                 success: true,
                 enabled: false,
                 label: "None",
                 message: "内容审查未启用"
             };
+            cacheSet('MODERATION_RESULTS', url, result);
+            return result;
         }
 
         // 根据不同渠道处理
+        let result;
         switch (uploadModerate.channel) {
             case 'moderatecontent.com':
-                return await moderateWithModerateContent(env, url, uploadModerate);
+                result = await moderateWithModerateContent(env, url, uploadModerate);
+                break;
                 
             case 'nsfwjs':
-                return await moderateWithNsfwJs(env, url, uploadModerate);
+                result = await moderateWithNsfwJs(env, url, uploadModerate);
+                break;
                 
             case 'nsfw-api':
-                return await moderateWithNsfwApi(env, url, uploadModerate);
+                result = await moderateWithNsfwApi(env, url, uploadModerate);
+                break;
                 
             case 'custom-api':
-                return await moderateWithCustomApi(env, url, uploadModerate);
+                result = await moderateWithCustomApi(env, url, uploadModerate);
+                break;
                 
             default:
-                return {
+                result = {
                     success: false,
                     enabled: true,
                     label: "None",
                     error: `不支持的审查渠道: ${uploadModerate.channel}`
                 };
         }
+
+        // 缓存成功的结果
+        if (result.success) {
+            cacheSet('MODERATION_RESULTS', url, result);
+        }
+
+        return result;
     } catch (error) {
         console.error('内容审查主函数错误:', error);
         return {
@@ -136,6 +219,21 @@ export async function moderateContent(env, url) {
             error: `审查处理失败: ${error.message}`
         };
     }
+}
+
+/**
+ * 使用缓存的安全配置获取
+ */
+async function fetchSecurityConfigWithCache(env) {
+    // 尝试从缓存获取
+    const cachedConfig = cacheGet('SECURITY_CONFIG', 'default');
+    if (cachedConfig) {
+        return cachedConfig;
+    }
+
+    const config = await fetchSecurityConfig(env);
+    cacheSet('SECURITY_CONFIG', 'default', config);
+    return config;
 }
 
 /**
@@ -151,28 +249,23 @@ async function moderateWithModerateContent(env, url, config) {
         
         // 检查API密钥
         if (!apikey || apikey.trim() === "") {
-            return {
-                success: false,
-                enabled: true,
-                label: "None",
-                error: "moderatecontent.com API密钥未配置"
-            };
+            throw new WorkerError("moderatecontent.com API密钥未配置", "MISSING_API_KEY", 400);
         }
 
         // 调用API
         const apiUrl = `https://api.moderatecontent.com/moderate/?key=${apikey}&url=${encodeURIComponent(url)}`;
-        const response = await fetch(apiUrl);
+        const response = await fetchWithTimeout(apiUrl, { timeout: 10000 });
         
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`API请求失败: ${response.status} - ${errorText}`);
+            throw new WorkerError(`API请求失败: ${response.status} - ${errorText}`, "API_REQUEST_FAILED", response.status);
         }
 
         const moderateData = await response.json();
         
         // 验证响应格式
         if (!moderateData || typeof moderateData.rating_label === 'undefined') {
-            throw new Error('无效的API响应格式');
+            throw new WorkerError('无效的API响应格式', "INVALID_RESPONSE_FORMAT", 400);
         }
 
         // 处理结果
@@ -196,7 +289,8 @@ async function moderateWithModerateContent(env, url, config) {
             label: "None",
             error: `moderatecontent.com 审查失败: ${error.message}`,
             channel: 'moderatecontent.com',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            errorCode: error.code || 'UNKNOWN_ERROR'
         };
     }
 }
@@ -214,28 +308,23 @@ async function moderateWithNsfwJs(env, url, config) {
         
         // 检查API路径配置
         if (!nsfwApiPath || nsfwApiPath.trim() === "") {
-            return {
-                success: false,
-                enabled: true,
-                label: "None",
-                error: "nsfwjs API路径未配置"
-            };
+            throw new WorkerError("nsfwjs API路径未配置", "MISSING_API_PATH", 400);
         }
 
         // 调用API
         const apiUrl = `${nsfwApiPath}?url=${encodeURIComponent(url)}`;
-        const response = await fetch(apiUrl);
+        const response = await fetchWithTimeout(apiUrl, { timeout: 10000 });
         
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`API请求失败: ${response.status} - ${errorText}`);
+            throw new WorkerError(`API请求失败: ${response.status} - ${errorText}`, "API_REQUEST_FAILED", response.status);
         }
 
         const moderateData = await response.json();
         
         // 验证响应格式
         if (!moderateData || typeof moderateData.score === 'undefined') {
-            throw new Error('无效的API响应格式');
+            throw new WorkerError('无效的API响应格式', "INVALID_RESPONSE_FORMAT", 400);
         }
 
         // 处理结果
@@ -272,7 +361,8 @@ async function moderateWithNsfwJs(env, url, config) {
             label: "None",
             error: `nsfwjs 审查失败: ${error.message}`,
             channel: 'nsfwjs',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            errorCode: error.code || 'UNKNOWN_ERROR'
         };
     }
 }
@@ -293,33 +383,29 @@ async function moderateWithNsfwApi(env, url, config) {
         
         // 检查API配置
         if (!apiKey || apiKey.trim() === "") {
-            return {
-                success: false,
-                enabled: true,
-                label: "None",
-                error: "NSFW API密钥未配置"
-            };
+            throw new WorkerError("NSFW API密钥未配置", "MISSING_API_KEY", 400);
         }
 
         // 调用API
-        const response = await fetch(`${apiEndpoint}?url=${encodeURIComponent(url)}`, {
+        const response = await fetchWithTimeout(`${apiEndpoint}?url=${encodeURIComponent(url)}`, {
             method: 'GET',
             headers: {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout: 10000
         });
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`API请求失败: ${response.status} - ${errorText}`);
+            throw new WorkerError(`API请求失败: ${response.status} - ${errorText}`, "API_REQUEST_FAILED", response.status);
         }
 
         const result = await response.json();
         
         // 验证响应格式
         if (!result || !result.data || typeof result.data.is_nsfw === 'undefined') {
-            throw new Error('无效的API响应格式');
+            throw new WorkerError('无效的API响应格式', "INVALID_RESPONSE_FORMAT", 400);
         }
 
         const { data } = result;
@@ -358,7 +444,8 @@ async function moderateWithNsfwApi(env, url, config) {
             label: "None",
             error: `NSFW API 审查失败: ${error.message}`,
             channel: 'nsfw-api',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            errorCode: error.code || 'UNKNOWN_ERROR'
         };
     }
 }
@@ -378,18 +465,14 @@ async function moderateWithCustomApi(env, url, config) {
         
         // 检查API配置
         if (!apiConfig.endpoint || !apiConfig.method) {
-            return {
-                success: false,
-                enabled: true,
-                label: "None",
-                error: "自定义API配置不完整"
-            };
+            throw new WorkerError("自定义API配置不完整", "INVALID_API_CONFIG", 400);
         }
 
         // 准备请求参数
         const requestOptions = {
             method: apiConfig.method.toUpperCase(),
-            headers: apiConfig.headers || {}
+            headers: apiConfig.headers || {},
+            timeout: 10000
         };
 
         // 处理请求体
@@ -404,18 +487,18 @@ async function moderateWithCustomApi(env, url, config) {
         }
 
         // 调用API
-        const response = await fetch(apiUrl, requestOptions);
+        const response = await fetchWithTimeout(apiUrl, requestOptions);
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(`API请求失败: ${response.status} - ${errorText}`);
+            throw new WorkerError(`API请求失败: ${response.status} - ${errorText}`, "API_REQUEST_FAILED", response.status);
         }
 
         const result = await response.json();
         
         // 验证响应格式
         if (!result) {
-            throw new Error('无效的API响应');
+            throw new WorkerError('无效的API响应', "INVALID_RESPONSE", 400);
         }
 
         // 应用响应映射规则
@@ -449,7 +532,8 @@ async function moderateWithCustomApi(env, url, config) {
             label: "None",
             error: `自定义API 审查失败: ${error.message}`,
             channel: 'custom-api',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            errorCode: error.code || 'UNKNOWN_ERROR'
         };
     }
 }
@@ -556,6 +640,7 @@ export async function moderationMiddleware(context, fileId, metadata, fileUrl) {
             
             metadata.ModerationChannel = moderationResult.channel;
             metadata.ModerationTimestamp = moderationResult.timestamp;
+            metadata.ModerationFromCache = moderationResult.fromCache || false;
             
             // 策略驱动的处理
             if (moderationResult.label === 'nsfw' || moderationResult.label === 'adult') {
@@ -607,25 +692,33 @@ export async function purgeCDNCache(env, cdnUrl, url, normalizedFolder) {
         return;
     }
 
+    // 并行清除缓存
+    const cachePromises = [];
+
     // 清除CDN缓存
-    try {
-        await purgeCFCache(env, cdnUrl);
-    } catch (error) {
-        console.error('Failed to clear CDN cache:', error);
-    }
+    cachePromises.push(
+        purgeCFCache(env, cdnUrl)
+            .catch(error => console.error('Failed to clear CDN cache:', error))
+    );
 
     // 清除api/randomFileList API缓存
-    try {
-        const cache = caches.default;
-        // await cache.delete(`${url.origin}/api/randomFileList`); delete有bug，通过写入一个max-age=0的response来清除缓存
-        const nullResponse = new Response(null, {
-            headers: { 'Cache-Control': 'max-age=0' },
-        });
+    cachePromises.push(
+        (async () => {
+            try {
+                const cache = caches.default;
+                const nullResponse = new Response(null, {
+                    headers: { 'Cache-Control': 'max-age=0' },
+                });
 
-        await cache.put(`${url.origin}/api/randomFileList?dir=${normalizedFolder}`, nullResponse);
-    } catch (error) {
-        console.error('Failed to clear cache:', error);
-    }
+                await cache.put(`${url.origin}/api/randomFileList?dir=${normalizedFolder}`, nullResponse);
+            } catch (error) {
+                console.error('Failed to clear cache:', error);
+            }
+        })()
+    );
+
+    // 等待所有缓存清除操作完成
+    await Promise.all(cachePromises);
 }
 
 // 结束上传：清除缓存，维护索引
@@ -635,39 +728,53 @@ export async function endUpload(context, fileId, metadata) {
     // 清除CDN缓存
     const cdnUrl = `https://${url.hostname}/file/${fileId}`;
     const normalizedFolder = (url.searchParams.get('uploadFolder') || '').replace(/^\/+/, '').replace(/\/{2,}/g, '/').replace(/\/$/, '');
-    await purgeCDNCache(env, cdnUrl, url, normalizedFolder);
+    
+    // 并行处理缓存清除和索引更新
+    const promises = [
+        purgeCDNCache(env, cdnUrl, url, normalizedFolder),
+        addFileToIndex(context, fileId, metadata)
+    ];
 
-    // 更新文件索引（索引更新时会自动计算容量统计）
-    await addFileToIndex(context, fileId, metadata);
+    await Promise.all(promises);
 }
 
 // 从 request 中解析 ip 地址
 export function getUploadIp(request) {
-    const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for") || request.headers.get("x-client-ip") || request.headers.get("x-host") || request.headers.get("x-originating-ip") || request.headers.get("x-cluster-client-ip") || request.headers.get("forwarded-for") || request.headers.get("forwarded") || request.headers.get("via") || request.headers.get("requester") || request.headers.get("true-client-ip") || request.headers.get("client-ip") || request.headers.get("x-remote-ip") || request.headers.get("x-originating-ip") || request.headers.get("fastly-client-ip") || request.headers.get("akamai-origin-hop") || request.headers.get("x-remote-addr") || request.headers.get("x-remote-host") || request.headers.get("x-client-ips")
+    const ipHeaders = [
+        "cf-connecting-ip", "x-real-ip", "x-forwarded-for", 
+        "x-client-ip", "x-host", "x-originating-ip", 
+        "x-cluster-client-ip", "forwarded-for", "forwarded", 
+        "via", "requester", "true-client-ip", "client-ip",
+        "x-remote-ip", "fastly-client-ip", "akamai-origin-hop",
+        "x-remote-addr", "x-remote-host", "x-client-ips"
+    ];
 
-    if (!ip) {
-        return null;
+    for (const header of ipHeaders) {
+        const ip = request.headers.get(header);
+        if (ip) {
+            // 处理多个IP地址的情况
+            const ips = ip.split(',').map(i => i.trim());
+            return ips[0]; // 返回第一个IP地址
+        }
     }
 
-    // 处理多个IP地址的情况
-    const ips = ip.split(',').map(i => i.trim());
-
-    return ips[0]; // 返回第一个IP地址
+    return null;
 }
 
 // 检查上传IP是否被封禁
 export async function isBlockedUploadIp(env, uploadIp) {
+    if (!uploadIp) return false;
+
     try {
         const db = getDatabase(env);
 
         let list = await db.get("manage@blockipList");
         if (list == null) {
-            list = [];
-        } else {
-            list = list.split(",");
+            return false;
         }
 
-        return list.includes(uploadIp);
+        const blockedIps = list.split(",").map(ip => ip.trim()).filter(ip => ip);
+        return blockedIps.includes(uploadIp);
     } catch (error) {
         console.error('Failed to check blocked IP:', error);
         // 如果数据库未配置，默认不阻止任何IP
@@ -680,98 +787,144 @@ export async function buildUniqueFileId(context, fileName, fileType = 'applicati
     const { env, url } = context;
     const db = getDatabase(env);
 
-    let fileExt = fileName.split('.').pop();
-    if (!fileExt || fileExt === fileName) {
-        fileExt = fileType.split('/').pop();
-        if (fileExt === fileType || fileExt === '' || fileExt === null || fileExt === undefined) {
-            fileExt = 'unknown';
-        }
+    if (!fileName) {
+        fileName = 'unknown_file';
     }
 
-    const nameType = url.searchParams.get('uploadNameType') || 'default';
-    const uploadFolder = url.searchParams.get('uploadFolder') || '';
-    const normalizedFolder = uploadFolder
-        ? uploadFolder.replace(/^\/+/, '').replace(/\/{2,}/g, '/').replace(/\/$/, '')
-        : '';
-
+    // 提取文件扩展名
+    let fileExt = getFileExtension(fileName, fileType);
+    
+    // 验证文件扩展名
     if (!isExtValid(fileExt)) {
-        fileExt = fileType.split('/').pop();
-        if (fileExt === fileType || fileExt === '' || fileExt === null || fileExt === undefined) {
-            fileExt = 'unknown';
-        }
+        fileExt = getFileExtensionFromMimeType(fileType);
     }
 
-    // 处理文件名，移除特殊字符
+    // 处理文件名
     fileName = sanitizeFileName(fileName);
+    
+    // 处理上传文件夹
+    const uploadFolder = url.searchParams.get('uploadFolder') || '';
+    const normalizedFolder = normalizeFolderPath(uploadFolder);
+    
+    // 获取命名方式
+    const nameType = url.searchParams.get('uploadNameType') || 'default';
 
-    const unique_index = Date.now() + Math.floor(Math.random() * 10000);
-    let baseId = '';
-
-    // 根据命名方式构建基础ID
-    if (nameType === 'index') {
-        baseId = normalizedFolder ? `${normalizedFolder}/${unique_index}.${fileExt}` : `${unique_index}.${fileExt}`;
-    } else if (nameType === 'origin') {
-        baseId = normalizedFolder ? `${normalizedFolder}/${fileName}` : fileName;
-    } else if (nameType === 'short') {
-        // 对于短链接，直接在循环中生成不重复的ID
-        while (true) {
-            const shortId = generateShortId(8);
-            const testFullId = normalizedFolder ? `${normalizedFolder}/${shortId}.${fileExt}` : `${shortId}.${fileExt}`;
-            if (await db.get(testFullId) === null) {
-                return testFullId;
-            }
-        }
-    } else {
-        baseId = normalizedFolder ? `${normalizedFolder}/${unique_index}_${fileName}` : `${unique_index}_${fileName}`;
+    // 根据命名方式生成ID
+    switch (nameType) {
+        case 'index':
+            return buildIndexBasedId(normalizedFolder, fileExt);
+            
+        case 'origin':
+            return buildOriginBasedId(db, normalizedFolder, fileName);
+            
+        case 'short':
+            return buildShortId(db, normalizedFolder, fileExt);
+            
+        default:
+            return buildDefaultId(db, normalizedFolder, fileName, fileExt);
     }
+}
 
-    // 检查基础ID是否已存在
+// 辅助函数：提取文件扩展名
+function getFileExtension(fileName, fileType) {
+    let ext = fileName.split('.').pop();
+    if (!ext || ext === fileName) {
+        ext = fileType.split('/').pop();
+    }
+    return ext || 'unknown';
+}
+
+// 辅助函数：从MIME类型获取扩展名
+function getFileExtensionFromMimeType(fileType) {
+    const ext = fileType.split('/').pop();
+    return ext === fileType || !ext ? 'unknown' : ext;
+}
+
+// 辅助函数：标准化文件夹路径
+function normalizeFolderPath(folder) {
+    if (!folder) return '';
+    
+    return folder
+        .replace(/^\/+/, '')      // 移除开头的斜杠
+        .replace(/\/{2,}/g, '/')  // 替换多个斜杠为单个斜杠
+        .replace(/\/$/, '');      // 移除结尾的斜杠
+}
+
+// 基于索引的ID生成
+function buildIndexBasedId(folder, ext) {
+    const uniqueIndex = Date.now() + Math.floor(Math.random() * 10000);
+    return folder ? `${folder}/${uniqueIndex}.${ext}` : `${uniqueIndex}.${ext}`;
+}
+
+// 基于原始文件名的ID生成
+async function buildOriginBasedId(db, folder, fileName) {
+    const baseId = folder ? `${folder}/${fileName}` : fileName;
+    
     if (await db.get(baseId) === null) {
         return baseId;
     }
+    
+    // 如果已存在，添加计数器
+    return findUniqueIdWithCounter(db, baseId, fileName);
+}
 
-    // 如果已存在，在文件名后面加上递增编号
-    let counter = 1;
-    while (true) {
-        let duplicateId;
-
-        if (nameType === 'index') {
-            const baseName = unique_index;
-            duplicateId = normalizedFolder ?
-                `${normalizedFolder}/${baseName}(${counter}).${fileExt}` :
-                `${baseName}(${counter}).${fileExt}`;
-        } else if (nameType === 'origin') {
-            const nameWithoutExt = fileName.substring(0, fileName.lastIndexOf('.'));
-            const ext = fileName.substring(fileName.lastIndexOf('.'));
-            duplicateId = normalizedFolder ?
-                `${normalizedFolder}/${nameWithoutExt}(${counter})${ext}` :
-                `${nameWithoutExt}(${counter})${ext}`;
-        } else {
-            const baseName = `${unique_index}_${fileName}`;
-            const nameWithoutExt = baseName.substring(0, baseName.lastIndexOf('.'));
-            const ext = baseName.substring(baseName.lastIndexOf('.'));
-            duplicateId = normalizedFolder ?
-                `${normalizedFolder}/${nameWithoutExt}(${counter})${ext}` :
-                `${nameWithoutExt}(${counter})${ext}`;
+// 短ID生成
+async function buildShortId(db, folder, ext) {
+    const maxRetries = 10;
+    let retries = 0;
+    
+    while (retries < maxRetries) {
+        const shortId = generateSecureId(8);
+        const testFullId = folder ? `${folder}/${shortId}.${ext}` : `${shortId}.${ext}`;
+        
+        if (await db.get(testFullId) === null) {
+            return testFullId;
         }
+        
+        retries++;
+    }
+    
+    throw new WorkerError('无法生成唯一的短文件ID', 'ID_GENERATION_FAILED', 500);
+}
 
-        // 检查新ID是否已存在
+// 默认ID生成
+async function buildDefaultId(db, folder, fileName, ext) {
+    const uniqueIndex = Date.now() + Math.floor(Math.random() * 10000);
+    const baseName = `${uniqueIndex}_${fileName}`;
+    const baseId = folder ? `${folder}/${baseName}` : baseName;
+    
+    if (await db.get(baseId) === null) {
+        return baseId;
+    }
+    
+    // 如果已存在，添加计数器
+    return findUniqueIdWithCounter(db, baseId, baseName);
+}
+
+// 查找带计数器的唯一ID
+async function findUniqueIdWithCounter(db, baseId, baseName) {
+    const maxRetries = 1000;
+    let counter = 1;
+    
+    while (counter <= maxRetries) {
+        const nameWithoutExt = baseName.substring(0, baseName.lastIndexOf('.')) || baseName;
+        const ext = baseName.substring(baseName.lastIndexOf('.')) || '';
+        
+        const duplicateId = baseId.replace(baseName, `${nameWithoutExt}(${counter})${ext}`);
+        
         if (await db.get(duplicateId) === null) {
             return duplicateId;
         }
-
+        
         counter++;
-
-        // 防止无限循环，最多尝试1000次
-        if (counter > 1000) {
-            throw new Error('无法生成唯一的文件ID');
-        }
     }
+    
+    throw new WorkerError('无法生成唯一的文件ID', 'ID_GENERATION_FAILED', 500);
 }
 
 // 基于uploadId的一致性渠道选择
 export function selectConsistentChannel(channels, uploadId, loadBalanceEnabled) {
-    if (!loadBalanceEnabled || !channels || channels.length === 0) {
+    if (!loadBalanceEnabled || !channels || !Array.isArray(channels) || channels.length === 0) {
         return channels[0];
     }
 
@@ -786,3 +939,124 @@ export function selectConsistentChannel(channels, uploadId, loadBalanceEnabled) 
     const index = Math.abs(hash) % channels.length;
     return channels[index];
 }
+
+// 带超时的fetch
+async function fetchWithTimeout(url, options = {}) {
+    const { timeout = 10000, ...fetchOptions } = options;
+    
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+        const response = await fetch(url, {
+            ...fetchOptions,
+            signal: controller.signal
+        });
+        return response;
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            throw new WorkerError(`请求超时（${timeout}ms）`, 'REQUEST_TIMEOUT', 408);
+        }
+        throw error;
+    } finally {
+        clearTimeout(id);
+    }
+}
+
+// 缓存工具函数
+function cacheGet(type, key) {
+    const cacheKey = `${type}_${key}`;
+    const entry = memoryCache.get(cacheKey);
+    
+    if (entry && Date.now() - entry.timestamp < CACHE_CONFIG[type].ttl * 1000) {
+        return entry.value;
+    }
+    
+    if (entry) {
+        memoryCache.delete(cacheKey);
+    }
+    
+    return null;
+}
+
+function cacheSet(type, key, value) {
+    const cacheKey = `${type}_${key}`;
+    
+    // 限制缓存大小
+    const cacheTypeKeys = Array.from(memoryCache.keys()).filter(k => k.startsWith(`${type}_`));
+    if (cacheTypeKeys.length >= CACHE_CONFIG[type].maxSize) {
+        // 删除最旧的缓存项
+        const oldestKey = cacheTypeKeys.sort((a, b) => 
+            memoryCache.get(a).timestamp - memoryCache.get(b).timestamp
+        )[0];
+        memoryCache.delete(oldestKey);
+    }
+    
+    memoryCache.set(cacheKey, {
+        value,
+        timestamp: Date.now()
+    });
+}
+
+// 错误日志记录
+export async function logError(env, error, context = {}) {
+    try {
+        if (!env.KV) return;
+        
+        const errorId = generateSecureId(16);
+        const errorLog = {
+            errorId,
+            message: error.message,
+            code: error.code || 'UNKNOWN_ERROR',
+            status: error.status || 500,
+            stack: error.stack,
+            timestamp: error.timestamp || Date.now(),
+            context: {
+                requestId: context.requestId,
+                ip: context.ip,
+                url: context.url,
+                userAgent: context.userAgent,
+                ...context
+            }
+        };
+        
+        await env.KV.put(`error_${errorId}`, JSON.stringify(errorLog), {
+            expirationTtl: 7 * 24 * 60 * 60 // 保存7天
+        });
+        
+        return errorId;
+    } catch (logError) {
+        console.error('Failed to log error:', logError);
+        return null;
+    }
+}
+
+// 模块导出
+export const ContentModeration = {
+    moderate: moderateContent,
+    moderateSimple: moderateContentSimple,
+    moderateBatch: moderateContentBatch,
+    middleware: moderationMiddleware
+};
+
+export const FileManagement = {
+    buildUniqueId: buildUniqueFileId,
+    endUpload: endUpload,
+    purgeCache: purgeCDNCache
+};
+
+export const Security = {
+    getIP: getUploadIp,
+    isBlockedIP: isBlockedUploadIp,
+    selectChannel: selectConsistentChannel
+};
+
+export const Utils = {
+    createResponse,
+    generateShortId,
+    generateSecureId,
+    getIPAddress,
+    sanitizeFileName,
+    isExtValid,
+    logError
+};
