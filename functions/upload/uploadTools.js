@@ -189,15 +189,15 @@ async function moderateWithNsfwJs(config, url) {
 
         // 根据NSFW分数设置标签
         if (nsfwScore >= 0.9) {
-            return "adult";
+            return "色情";
         } else if (nsfwScore >= 0.7) {
-            return "teen";
+            return "成年";
         } else {
-            return "everyone";
+            return "大众";
         }
     } catch (error) {
         console.error('nsfwjs moderation failed:', error);
-        return "None";
+        return "未审";
     }
 }
 
