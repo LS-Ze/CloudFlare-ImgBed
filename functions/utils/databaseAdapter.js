@@ -61,23 +61,26 @@ export function createDatabaseAdapter(env) {
     }
 }
 
-// 错误处理装饰器
-function handleAdapterError(target, propertyKey, descriptor) {
-    const originalMethod = descriptor.value;
-    
-    descriptor.value = async function(...args) {
+/**
+ * 错误处理包装函数
+ * @param {Function} method - 要包装的方法
+ * @param {String} methodName - 方法名称
+ * @returns {Function} 包装后的方法
+ */
+function wrapWithErrorHandling(method, methodName) {
+    return async function(...args) {
         try {
-            return await originalMethod.apply(this, args);
+            return await method.apply(this, args);
         } catch (error) {
             const errorDetails = {
-                method: propertyKey,
+                method: methodName,
                 args: args,
                 error: error.message,
                 stack: error.stack,
                 adapterType: this.constructor.name
             };
             
-            console.error(`Database adapter error in ${propertyKey}:`, errorDetails);
+            console.error(`Database adapter error in ${methodName}:`, errorDetails);
             
             throw new DatabaseAdapterError(
                 `Database adapter operation failed: ${error.message}`,
@@ -87,8 +90,6 @@ function handleAdapterError(target, propertyKey, descriptor) {
             );
         }
     };
-    
-    return descriptor;
 }
 
 /**
@@ -99,106 +100,112 @@ class KVAdapter {
     constructor(kv) {
         this.kv = kv;
         this.type = 'kv';
+        
+        // 手动包装所有方法的错误处理
+        this.put = wrapWithErrorHandling(this.put.bind(this), 'put');
+        this.get = wrapWithErrorHandling(this.get.bind(this), 'get');
+        this.getWithMetadata = wrapWithErrorHandling(this.getWithMetadata.bind(this), 'getWithMetadata');
+        this.delete = wrapWithErrorHandling(this.delete.bind(this), 'delete');
+        this.list = wrapWithErrorHandling(this.list.bind(this), 'list');
+        this.putFile = wrapWithErrorHandling(this.putFile.bind(this), 'putFile');
+        this.getFile = wrapWithErrorHandling(this.getFile.bind(this), 'getFile');
+        this.getFileWithMetadata = wrapWithErrorHandling(this.getFileWithMetadata.bind(this), 'getFileWithMetadata');
+        this.deleteFile = wrapWithErrorHandling(this.deleteFile.bind(this), 'deleteFile');
+        this.listFiles = wrapWithErrorHandling(this.listFiles.bind(this), 'listFiles');
+        this.putSetting = wrapWithErrorHandling(this.putSetting.bind(this), 'putSetting');
+        this.getSetting = wrapWithErrorHandling(this.getSetting.bind(this), 'getSetting');
+        this.deleteSetting = wrapWithErrorHandling(this.deleteSetting.bind(this), 'deleteSetting');
+        this.listSettings = wrapWithErrorHandling(this.listSettings.bind(this), 'listSettings');
+        this.putIndexOperation = wrapWithErrorHandling(this.putIndexOperation.bind(this), 'putIndexOperation');
+        this.getIndexOperation = wrapWithErrorHandling(this.getIndexOperation.bind(this), 'getIndexOperation');
+        this.deleteIndexOperation = wrapWithErrorHandling(this.deleteIndexOperation.bind(this), 'deleteIndexOperation');
+        this.listIndexOperations = wrapWithErrorHandling(this.listIndexOperations.bind(this), 'listIndexOperations');
+        this.markIndexOperationProcessed = wrapWithErrorHandling(this.markIndexOperationProcessed.bind(this), 'markIndexOperationProcessed');
+        this.transaction = wrapWithErrorHandling(this.transaction.bind(this), 'transaction');
+        this.batch = wrapWithErrorHandling(this.batch.bind(this), 'batch');
+        this.clearCache = wrapWithErrorHandling(this.clearCache.bind(this), 'clearCache');
     }
 
     // 直接代理到KV的方法
-    @handleAdapterError
     async put(key, value, options) {
         options = options || {};
         return await this.kv.put(key, value, options);
     }
 
-    @handleAdapterError
     async get(key, options) {
         options = options || {};
         return await this.kv.get(key, options);
     }
 
-    @handleAdapterError
     async getWithMetadata(key, options) {
         options = options || {};
         return await this.kv.getWithMetadata(key, options);
     }
 
-    @handleAdapterError
     async delete(key, options) {
         options = options || {};
         return await this.kv.delete(key, options);
     }
 
-    @handleAdapterError
     async list(options) {
         options = options || {};
         return await this.kv.list(options);
     }
 
     // 为了兼容性，添加一些别名方法
-    @handleAdapterError
     async putFile(fileId, value, options) {
         return await this.put(fileId, value, options);
     }
 
-    @handleAdapterError
     async getFile(fileId, options) {
         const result = await this.getWithMetadata(fileId, options);
         return result;
     }
 
-    @handleAdapterError
     async getFileWithMetadata(fileId, options) {
         return await this.getWithMetadata(fileId, options);
     }
 
-    @handleAdapterError
     async deleteFile(fileId, options) {
         return await this.delete(fileId, options);
     }
 
-    @handleAdapterError
     async listFiles(options) {
         return await this.list(options);
     }
 
-    @handleAdapterError
     async putSetting(key, value, options) {
         return await this.put(key, value, options);
     }
 
-    @handleAdapterError
     async getSetting(key, options) {
         return await this.get(key, options);
     }
 
-    @handleAdapterError
     async deleteSetting(key, options) {
         return await this.delete(key, options);
     }
 
-    @handleAdapterError
     async listSettings(options) {
         return await this.list(options);
     }
 
-    @handleAdapterError
     async putIndexOperation(operationId, operation, options) {
         const key = `manage@index@operation_${operationId}`;
         return await this.put(key, JSON.stringify(operation), options);
     }
 
-    @handleAdapterError
     async getIndexOperation(operationId, options) {
         const key = `manage@index@operation_${operationId}`;
         const result = await this.get(key, options);
         return result ? JSON.parse(result) : null;
     }
 
-    @handleAdapterError
     async deleteIndexOperation(operationId, options) {
         const key = `manage@index@operation_${operationId}`;
         return await this.delete(key, options);
     }
 
-    @handleAdapterError
     async listIndexOperations(options) {
         const listOptions = Object.assign({}, options, {
             prefix: 'manage@index@operation_'
@@ -231,7 +238,6 @@ class KVAdapter {
     /**
      * 标记索引操作已处理
      */
-    @handleAdapterError
     async markIndexOperationProcessed(operationId, options) {
         const key = `manage@index@operation_${operationId}`;
         const operationData = await this.get(key, options);
@@ -253,7 +259,6 @@ class KVAdapter {
     /**
      * 执行事务
      */
-    @handleAdapterError
     async transaction(operations) {
         if (!Array.isArray(operations) || operations.length === 0) {
             throw new DatabaseAdapterError('Invalid operations array', 'INVALID_OPERATIONS', 400);
@@ -280,7 +285,6 @@ class KVAdapter {
     /**
      * 批量操作
      */
-    @handleAdapterError
     async batch(operations) {
         return this.transaction(operations);
     }
@@ -288,7 +292,6 @@ class KVAdapter {
     /**
      * 清除缓存
      */
-    @handleAdapterError
     async clearCache() {
         // KV本身没有缓存，所以这个方法是一个空实现
         return true;
