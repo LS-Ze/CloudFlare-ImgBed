@@ -132,11 +132,11 @@ export async function moderateContent(env, url) {
 
             const score = moderate_data.score || 0;
             if (nsfw >= 0.9) {
-                label = "色情";
+                label = "adult";
             } else if (nsfw >= 0.7) {
-                label = "青年";
+                label = "teen";
             } else {
-                label = "大众";
+                label = "everyone";
             }
         } catch (error) {
             console.error('Moderate Error:', error);
