@@ -131,17 +131,17 @@ export async function moderateContent(env, url) {
             const moderate_data = await fetchResponse.json();
 
             const score = moderate_data.score || 0;
-            if (score >= 0.9) {
-                label = "adult";
-            } else if (score >= 0.7) {
-                label = "teen";
+            if (nsfw >= 0.9) {
+                label = "色情";
+            } else if (nsfw >= 0.7) {
+                label = "青年";
             } else {
-                label = "everyone";
+                label = "大众";
             }
         } catch (error) {
             console.error('Moderate Error:', error);
             // 将不带审查的图片写入数据库
-            label = "None";
+            label = "未审查";
         }
 
         return label;
