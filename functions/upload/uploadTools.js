@@ -471,7 +471,7 @@ async function moderateWithNsfwJs(config, url) {
         }
     } catch (error) {
         console.error('nsfwjs moderation failed:', error);
-        return "未审";
+        return "None";
     }
 }
 
