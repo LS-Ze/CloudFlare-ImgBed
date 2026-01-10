@@ -1,5 +1,3 @@
-// 增强版上传工具函数 - 集成所有改进
-
 import { fetchSecurityConfig } from "../utils/sysConfig";
 import { purgeCFCache } from "../utils/purgeCache";
 import { addFileToIndex } from "../utils/indexManager.js";
@@ -83,15 +81,7 @@ export function isExtValid(fileExt) {
     ].includes(fileExt);
 }
 
-/**
- * 增强版内容审查函数
- * 支持多个审查渠道，处理不同的响应格式
- * 返回丰富的审查结果信息
- * 
- * @param {Object} env - 环境变量
- * @param {string} url - 要审查的URL
- * @returns {Object} - 审查结果对象
- */
+// 图像审查
 export async function moderateContent(env, url) {
     try {
         const securityConfig = await fetchSecurityConfig(env);
@@ -514,6 +504,126 @@ export async function moderateContentBatch(env, urls) {
     return Promise.all(promises);
 }
 
+/**
+ * 内容审查中间件
+ * 统一处理内容审查逻辑
+ * 
+ * @param {Object} context - 请求上下文
+ * @param {string} fileId - 文件ID
+ * @param {Object} metadata - 文件元数据
+ * @param {string} fileUrl - 文件URL
+ * @returns {Object} - 处理结果
+ */
+export async function moderationMiddleware(context, fileId, metadata, fileUrl) {
+    const { env, db, securityConfig } = context;
+    const uploadModerate = securityConfig.upload.moderate;
+
+    if (!uploadModerate || !uploadModerate.enabled) {
+        metadata.Label = 'moderation_disabled';
+        metadata.Status = 'active';
+        return { success: true };
+    }
+
+    try {
+        // 调用增强版审查
+        const moderationResult = await moderateContent(env, fileUrl);
+        
+        if (moderationResult.success) {
+            // 更新元数据
+            metadata.Label = moderationResult.label;
+            
+            // 保存详细信息
+            if (moderationResult.nsfwScore !== undefined) {
+                metadata.NSFWScore = moderationResult.nsfwScore;
+            }
+            if (moderationResult.sfwScore !== undefined) {
+                metadata.SFWScore = moderationResult.sfwScore;
+            }
+            if (moderationResult.isNsfw !== undefined) {
+                metadata.IsNSFW = moderationResult.isNsfw;
+            }
+            if (moderationResult.score !== undefined) {
+                metadata.ModerationScore = moderationResult.score;
+            }
+            
+            metadata.ModerationChannel = moderationResult.channel;
+            metadata.ModerationTimestamp = moderationResult.timestamp;
+            
+            // 策略驱动的处理
+            if (moderationResult.label === 'nsfw' || moderationResult.label === 'adult') {
+                switch (uploadModerate.policy) {
+                    case 'quarantine':
+                        metadata.Status = 'quarantined';
+                        break;
+                    case 'delete':
+                        await db.delete(fileId);
+                        return { 
+                            success: false, 
+                            status: 403, 
+                            message: "Content violates policy" 
+                        };
+                    case 'restrict':
+                        metadata.Status = 'restricted';
+                        break;
+                    default:
+                        metadata.Status = 'active';
+                }
+            } else {
+                metadata.Status = 'active';
+            }
+            
+            return { success: true };
+        } else {
+            // 审查失败处理
+            metadata.Label = 'moderation_failed';
+            metadata.ModerationError = moderationResult.error;
+            metadata.ModerationChannel = moderationResult.channel;
+            metadata.ModerationTimestamp = moderationResult.timestamp;
+            metadata.Status = 'moderation_pending';
+            
+            return { success: false, error: moderationResult.error };
+        }
+    } catch (error) {
+        // 异常处理
+        metadata.Label = 'moderation_error';
+        metadata.ModerationError = error.message;
+        metadata.Status = 'moderation_failed';
+        
+        return { success: false, error: error.message };
+    }
+}
+
+    // nsfw 渠道 和 默认渠道
+    if (uploadModerate.channel === 'nsfwjs') {
+        const nsfwApiPath = securityConfig.upload.moderate.nsfwApiPath;
+
+        try {
+            const fetchResponse = await fetch(`${nsfwApiPath}?url=${encodeURIComponent(url)}`);
+            if (!fetchResponse.ok) {
+                throw new Error(`HTTP error! status: ${fetchResponse.status}`);
+            }
+            const moderate_data = await fetchResponse.json();
+
+            const score = moderate_data.score || 0;
+            if (score >= 0.9) {
+                label = "adult";
+            } else if (score >= 0.7) {
+                label = "teen";
+            } else {
+                label = "everyone";
+            }
+        } catch (error) {
+            console.error('Moderate Error:', error);
+            // 将不带审查的图片写入数据库
+            label = "None";
+        }
+
+        return label;
+    }
+
+    return label;
+}
+
 // 清除CDN缓存
 export async function purgeCDNCache(env, cdnUrl, url, normalizedFolder) {
     if (env.dev_mode === 'true') {
@@ -554,78 +664,23 @@ export async function endUpload(context, fileId, metadata) {
     await addFileToIndex(context, fileId, metadata);
 }
 
-// 从 request 中解析 ip 地址 - 改进版本
+// 从 request 中解析 ip 地址
 export function getUploadIp(request) {
-    try {
-        // 1. 优先使用EdgeOne提供的EO-Connecting-IP头
-        const eoConnectingIp = request.headers.get('EO-Connecting-IP');
-        if (eoConnectingIp) {
-            console.log(`Using EO-Connecting-IP: ${eoConnectingIp}`);
-            return eoConnectingIp;
-        }
-        // 1. 优先使用Cloudflare提供的cf对象（推荐方法）
-        if (request.cf && request.cf.clientIp) {
-            console.log(`Using request.cf.clientIp: ${request.cf.clientIp}`);
-            return request.cf.clientIp;
-        }
-        
-        // 2. 使用CF-Connecting-IP头（次优选择）
-        const cfConnectingIp = request.headers.get('CF-Connecting-IP');
-        if (cfConnectingIp) {
-            console.log(`Using CF-Connecting-IP: ${cfConnectingIp}`);
-            return cfConnectingIp;
-        }
-        
-        // 3. 使用X-Forwarded-For头（需要解析第一个IP）
-        const xForwardedFor = request.headers.get('X-Forwarded-For');
-        if (xForwardedFor) {
-            const clientIp = xForwardedFor.split(',')[0].trim();
-            console.log(`Using X-Forwarded-For: ${clientIp}`);
-            return clientIp;
-        }
-        
-        // 4. 尝试其他常见的IP头
-        const ipHeaders = [
-            'x-real-ip', 'x-client-ip', 'x-host', 'x-originating-ip',
-            'x-cluster-client-ip', 'forwarded-for', 'forwarded', 'via',
-            'requester', 'true-client-ip', 'client-ip', 'x-remote-ip',
-            'fastly-client-ip', 'akamai-origin-hop', 'x-remote-addr',
-            'x-remote-host', 'x-client-ips'
-        ];
-        
-        for (const header of ipHeaders) {
-            const ip = request.headers.get(header);
-            if (ip) {
-                console.log(`Using ${header}: ${ip}`);
-                return ip.split(',')[0].trim();
-            }
-        }
-        
-        // 5. 最后尝试使用remoteAddress（可能不是真实IP）
-        if (request.remoteAddress) {
-            console.log(`Using remoteAddress: ${request.remoteAddress}`);
-            return request.remoteAddress;
-        }
-        
-        // 6. 所有方法都失败时返回unknown
-        console.warn('Failed to get client IP address using all methods');
-        return 'unknown';
-        
-    } catch (error) {
-        console.error('Error getting upload IP:', error);
-        return 'unknown';
+    const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || request.headers.get("x-forwarded-for") || request.headers.get("x-client-ip") || request.headers.get("x-host") || request.headers.get("x-originating-ip") || request.headers.get("x-cluster-client-ip") || request.headers.get("forwarded-for") || request.headers.get("forwarded") || request.headers.get("via") || request.headers.get("requester") || request.headers.get("true-client-ip") || request.headers.get("client-ip") || request.headers.get("x-remote-ip") || request.headers.get("x-originating-ip") || request.headers.get("fastly-client-ip") || request.headers.get("akamai-origin-hop") || request.headers.get("x-remote-addr") || request.headers.get("x-remote-host") || request.headers.get("x-client-ips")
+
+    if (!ip) {
+        return null;
     }
+
+    // 处理多个IP地址的情况
+    const ips = ip.split(',').map(i => i.trim());
+
+    return ips[0]; // 返回第一个IP地址
 }
 
 // 检查上传IP是否被封禁
 export async function isBlockedUploadIp(env, uploadIp) {
     try {
-        // 如果IP是unknown，不阻止上传
-        if (uploadIp === 'unknown') {
-            console.warn('IP is unknown, skipping block check');
-            return false;
-        }
-
         const db = getDatabase(env);
 
         let list = await db.get("manage@blockipList");
@@ -635,14 +690,10 @@ export async function isBlockedUploadIp(env, uploadIp) {
             list = list.split(",");
         }
 
-        const isBlocked = list.includes(uploadIp);
-        if (isBlocked) {
-            console.log(`IP ${uploadIp} is blocked`);
-        }
-        return isBlocked;
+        return list.includes(uploadIp);
     } catch (error) {
         console.error('Failed to check blocked IP:', error);
-        // 如果数据库未配置或出现错误，默认不阻止任何IP
+        // 如果数据库未配置，默认不阻止任何IP
         return false;
     }
 }
@@ -757,93 +808,4 @@ export function selectConsistentChannel(channels, uploadId, loadBalanceEnabled) 
 
     const index = Math.abs(hash) % channels.length;
     return channels[index];
-}
-
-/**
- * 内容审查中间件
- * 统一处理内容审查逻辑
- * 
- * @param {Object} context - 请求上下文
- * @param {string} fileId - 文件ID
- * @param {Object} metadata - 文件元数据
- * @param {string} fileUrl - 文件URL
- * @returns {Object} - 处理结果
- */
-export async function moderationMiddleware(context, fileId, metadata, fileUrl) {
-    const { env, db, securityConfig } = context;
-    const uploadModerate = securityConfig.upload.moderate;
-
-    if (!uploadModerate || !uploadModerate.enabled) {
-        metadata.Label = 'moderation_disabled';
-        metadata.Status = 'active';
-        return { success: true };
-    }
-
-    try {
-        // 调用增强版审查
-        const moderationResult = await moderateContent(env, fileUrl);
-        
-        if (moderationResult.success) {
-            // 更新元数据
-            metadata.Label = moderationResult.label;
-            
-            // 保存详细信息
-            if (moderationResult.nsfwScore !== undefined) {
-                metadata.NSFWScore = moderationResult.nsfwScore;
-            }
-            if (moderationResult.sfwScore !== undefined) {
-                metadata.SFWScore = moderationResult.sfwScore;
-            }
-            if (moderationResult.isNsfw !== undefined) {
-                metadata.IsNSFW = moderationResult.isNsfw;
-            }
-            if (moderationResult.score !== undefined) {
-                metadata.ModerationScore = moderationResult.score;
-            }
-            
-            metadata.ModerationChannel = moderationResult.channel;
-            metadata.ModerationTimestamp = moderationResult.timestamp;
-            
-            // 策略驱动的处理
-            if (moderationResult.label === 'nsfw' || moderationResult.label === 'adult') {
-                switch (uploadModerate.policy) {
-                    case 'quarantine':
-                        metadata.Status = 'quarantined';
-                        break;
-                    case 'delete':
-                        await db.delete(fileId);
-                        return { 
-                            success: false, 
-                            status: 403, 
-                            message: "Content violates policy" 
-                        };
-                    case 'restrict':
-                        metadata.Status = 'restricted';
-                        break;
-                    default:
-                        metadata.Status = 'active';
-                }
-            } else {
-                metadata.Status = 'active';
-            }
-            
-            return { success: true };
-        } else {
-            // 审查失败处理
-            metadata.Label = 'moderation_failed';
-            metadata.ModerationError = moderationResult.error;
-            metadata.ModerationChannel = moderationResult.channel;
-            metadata.ModerationTimestamp = moderationResult.timestamp;
-            metadata.Status = 'moderation_pending';
-            
-            return { success: false, error: moderationResult.error };
-        }
-    } catch (error) {
-        // 异常处理
-        metadata.Label = 'moderation_error';
-        metadata.ModerationError = error.message;
-        metadata.Status = 'moderation_failed';
-        
-        return { success: false, error: error.message };
-    }
 }
