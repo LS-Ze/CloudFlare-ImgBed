@@ -1,4 +1,4 @@
-/* 索引管理器 */
+/* 优化版索引管理器 */
 
 /**
  * 文件索引结构（分块存储）：
@@ -40,12 +40,150 @@
 import { getDatabase } from './databaseAdapter.js';
 import { matchesTags } from './tagHelpers.js';
 
+// 常量定义
 const INDEX_KEY = 'manage@index';
 const INDEX_META_KEY = 'manage@index@meta'; // 索引元数据键
 const OPERATION_KEY_PREFIX = 'manage@index@operation_';
 const INDEX_CHUNK_SIZE = 10000; // 索引分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
 const BATCH_SIZE = 10; // 批量处理大小
+
+// 缓存配置
+const CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
+const QUERY_CACHE_TTL = 10 * 60 * 1000; // 10分钟查询缓存
+const MAX_QUERY_CACHE_SIZE = 50; // 最多缓存50个查询
+
+// 索引缓存
+const indexCache = {
+    data: null,
+    timestamp: 0
+};
+
+// 查询缓存
+const queryCache = {};
+
+// 统计信息
+const indexStats = {
+    operations: {
+        add: 0,
+        remove: 0,
+        move: 0,
+        batchAdd: 0,
+        batchRemove: 0,
+        batchMove: 0,
+        merge: 0,
+        rebuild: 0
+    },
+    errors: 0,
+    totalOperations: 0,
+    totalDuration: 0
+};
+
+// TypeScript类型定义（JSDoc形式）
+/**
+ * @typedef {Object} FileItem
+ * @property {string} id - 文件ID
+ * @property {Object} metadata - 文件元数据
+ */
+
+/**
+ * @typedef {Object} Index
+ * @property {FileItem[]} files - 文件数组
+ * @property {number} lastUpdated - 最后更新时间戳
+ * @property {number} totalCount - 总文件数
+ * @property {string|null} lastOperationId - 最后处理的操作ID
+ * @property {boolean} success - 是否成功
+ */
+
+/**
+ * @typedef {Object} Operation
+ * @property {string} id - 操作ID
+ * @property {string} type - 操作类型
+ * @property {number} timestamp - 时间戳
+ * @property {Object} data - 操作数据
+ */
+
+/**
+ * @typedef {Object} IndexMetadata
+ * @property {number} lastUpdated - 最后更新时间戳
+ * @property {number} totalCount - 总文件数
+ * @property {number} totalSizeMB - 总大小（MB）
+ * @property {Object} channelStats - 渠道统计
+ * @property {string|null} lastOperationId - 最后处理的操作ID
+ * @property {number} chunkCount - 分块数量
+ * @property {number} chunkSize - 分块大小
+ */
+
+/**
+ * 中间件：统一处理索引操作
+ * @param {Function} operation - 具体操作函数
+ * @param {Object} context - 上下文对象
+ * @param {Array} args - 操作参数
+ * @returns {Object} 操作结果
+ */
+async function indexOperationMiddleware(operation, context, ...args) {
+    const startTime = Date.now();
+    try {
+        // 执行实际操作
+        const result = await operation(context, ...args);
+        
+        // 更新统计
+        updateIndexStats(operation.name, Date.now() - startTime, true);
+        
+        // 清除相关缓存
+        clearIndexCache();
+        
+        return {
+            ...result,
+            duration: Date.now() - startTime,
+            timestamp: Date.now()
+        };
+    } catch (error) {
+        console.error(`Index operation ${operation.name} failed:`, error);
+        
+        // 更新统计
+        updateIndexStats(operation.name, Date.now() - startTime, false);
+        
+        return {
+            success: false,
+            error: error.message,
+            stack: error.stack,
+            timestamp: Date.now(),
+            duration: Date.now() - startTime
+        };
+    }
+}
+
+/**
+ * 更新操作统计
+ * @param {string} operation - 操作名称
+ * @param {number} duration - 操作持续时间
+ * @param {boolean} success - 是否成功
+ */
+function updateIndexStats(operation, duration, success = true) {
+    indexStats.totalOperations++;
+    indexStats.totalDuration += duration;
+    
+    const operationMap = {
+        'addFileToIndex': 'add',
+        'removeFileFromIndex': 'remove',
+        'moveFileInIndex': 'move',
+        'batchAddFilesToIndex': 'batchAdd',
+        'batchRemoveFilesFromIndex': 'batchRemove',
+        'batchMoveFilesInIndex': 'batchMove',
+        'mergeOperationsToIndex': 'merge',
+        'rebuildIndex': 'rebuild'
+    };
+    
+    const statName = operationMap[operation] || operation;
+    if (indexStats.operations[statName] !== undefined) {
+        indexStats.operations[statName]++;
+    }
+    
+    if (!success) {
+        indexStats.errors++;
+    }
+}
 
 /**
  * 添加文件到索引
@@ -54,28 +192,30 @@ const BATCH_SIZE = 10; // 批量处理大小
  * @param {Object} metadata - 文件元数据
  */
 export async function addFileToIndex(context, fileId, metadata = null) {
-    const { env } = context;
-    const db = getDatabase(env);
+    return indexOperationMiddleware(async (ctx, id, meta) => {
+        const { env } = ctx;
+        const db = getDatabase(env);
 
-    try {
-        if (metadata === null) {
+        if (meta === null) {
             // 如果未传入metadata，尝试从数据库中获取
-            const fileData = await db.getWithMetadata(fileId);
-            metadata = fileData.metadata || {};
+            try {
+                const fileData = await db.getWithMetadata(id);
+                meta = fileData.metadata || {};
+            } catch (error) {
+                console.warn(`Failed to get metadata for file ${id}, using empty metadata`);
+                meta = {};
+            }
         }
 
         // 记录原子操作
-        const operationId = await recordOperation(context, 'add', {
-            fileId,
-            metadata
+        const operationId = await recordOperation(ctx, 'add', {
+            fileId: id,
+            metadata: meta
         });
 
-        console.log(`File ${fileId} add operation recorded with ID: ${operationId}`);
+        console.log(`File ${id} add operation recorded with ID: ${operationId}`);
         return { success: true, operationId };
-    } catch (error) {
-        console.error('Error recording add file operation:', error);
-        return { success: false, error: error.message };
-    }
+    }, context, fileId, metadata);
 }
 
 /**
@@ -87,16 +227,32 @@ export async function addFileToIndex(context, fileId, metadata = null) {
  * @returns {Object} 返回操作结果 { operationId, totalProcessed }
  */
 export async function batchAddFilesToIndex(context, files, options = {}) {
-    try {
-        const { env } = context;
-        const { skipExisting = false } = options;
+    return indexOperationMiddleware(async (ctx, fileList, opts) => {
+        const { env } = ctx;
+        const { skipExisting = false } = opts;
         const db = getDatabase(env);
+
+        // 验证输入
+        if (!Array.isArray(fileList) || fileList.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No files to process'
+            };
+        }
 
         // 处理每个文件的metadata
         const processedFiles = [];
-        for (const fileItem of files) {
+        for (const fileItem of fileList) {
             const { fileId, metadata } = fileItem;
             let finalMetadata = metadata;
+
+            // 验证fileId
+            if (!fileId || typeof fileId !== 'string') {
+                console.warn('Skipping invalid fileId:', fileItem);
+                continue;
+            }
 
             // 如果没有提供metadata，尝试从数据库中获取
             if (!finalMetadata) {
@@ -115,26 +271,30 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
             });
         }
 
+        if (processedFiles.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No valid files to process'
+            };
+        }
+
         // 记录批量添加操作
-        const operationId = await recordOperation(context, 'batch_add', {
+        const operationId = await recordOperation(ctx, 'batch_add', {
             files: processedFiles,
             options: { skipExisting }
         });
 
-        console.log(`Batch add operation recorded with ID: ${operationId}, ${files.length} files`);
+        console.log(`Batch add operation recorded with ID: ${operationId}, ${processedFiles.length} files`);
         return {
             success: true,
             operationId,
-            totalProcessed: files.length
+            totalProcessed: processedFiles.length,
+            originalCount: fileList.length,
+            validCount: processedFiles.length
         };
-    } catch (error) {
-        console.error('Error recording batch add files operation:', error);
-        return {
-            success: false,
-            error: error.message,
-            totalProcessed: 0
-        };
-    }
+    }, context, files, options);
 }
 
 /**
@@ -143,18 +303,20 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
  * @param {string} fileId - 文件 ID
  */
 export async function removeFileFromIndex(context, fileId) {
-    try {
+    return indexOperationMiddleware(async (ctx, id) => {
+        // 验证输入
+        if (!id || typeof id !== 'string') {
+            throw new Error('Invalid fileId');
+        }
+
         // 记录删除操作
-        const operationId = await recordOperation(context, 'remove', {
-            fileId
+        const operationId = await recordOperation(ctx, 'remove', {
+            fileId: id
         });
 
-        console.log(`File ${fileId} remove operation recorded with ID: ${operationId}`);
+        console.log(`File ${id} remove operation recorded with ID: ${operationId}`);
         return { success: true, operationId };
-    } catch (error) {
-        console.error('Error recording remove file operation:', error);
-        return { success: false, error: error.message };
-    }
+    }, context, fileId);
 }
 
 /**
@@ -163,26 +325,43 @@ export async function removeFileFromIndex(context, fileId) {
  * @param {Array} fileIds - 文件 ID 数组
  */
 export async function batchRemoveFilesFromIndex(context, fileIds) {
-    try {
+    return indexOperationMiddleware(async (ctx, ids) => {
+        // 验证输入
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No fileIds to process'
+            };
+        }
+
+        // 去重和过滤空值
+        const uniqueFileIds = [...new Set(ids.filter(id => id && typeof id === 'string'))];
+        
+        if (uniqueFileIds.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No valid file IDs to process'
+            };
+        }
+
         // 记录批量删除操作
-        const operationId = await recordOperation(context, 'batch_remove', {
-            fileIds
+        const operationId = await recordOperation(ctx, 'batch_remove', {
+            fileIds: uniqueFileIds
         });
 
-        console.log(`Batch remove operation recorded with ID: ${operationId}, ${fileIds.length} files`);
+        console.log(`Batch remove operation recorded with ID: ${operationId}, ${uniqueFileIds.length} files`);
         return {
             success: true,
             operationId,
-            totalProcessed: fileIds.length
+            totalProcessed: uniqueFileIds.length,
+            originalCount: ids.length,
+            uniqueCount: uniqueFileIds.length
         };
-    } catch (error) {
-        console.error('Error recording batch remove files operation:', error);
-        return {
-            success: false,
-            error: error.message,
-            totalProcessed: 0
-        };
-    }
+    }, context, fileIds);
 }
 
 /**
@@ -194,36 +373,46 @@ export async function batchRemoveFilesFromIndex(context, fileIds) {
  * @returns {Object} 返回操作结果 { success, operationId?, error? }
  */
 export async function moveFileInIndex(context, originalFileId, newFileId, newMetadata = null) {
-    try {
-        const { env } = context;
+    return indexOperationMiddleware(async (ctx, originalId, newId, metadata) => {
+        const { env } = ctx;
         const db = getDatabase(env);
 
+        // 验证输入
+        if (!originalId || !newId || typeof originalId !== 'string' || typeof newId !== 'string') {
+            throw new Error('Invalid file IDs');
+        }
+
+        if (originalId === newId) {
+            return {
+                success: true,
+                operationId: null,
+                message: 'Original and new file IDs are the same'
+            };
+        }
+
         // 确定最终的metadata
-        let finalMetadata = newMetadata;
+        let finalMetadata = metadata;
         if (finalMetadata === null) {
             // 如果没有提供新metadata，尝试从数据库中获取
             try {
-                const fileData = await db.getWithMetadata(newFileId);
+                const fileData = await db.getWithMetadata(newId);
                 finalMetadata = fileData.metadata || {};
             } catch (error) {
-                console.warn(`Failed to get metadata for new file ${newFileId}:`, error);
+                console.warn(`Failed to get metadata for new file ${newId}:`, error);
                 finalMetadata = {};
             }
         }
 
         // 记录移动操作
-        const operationId = await recordOperation(context, 'move', {
-            originalFileId,
-            newFileId,
+        const operationId = await recordOperation(ctx, 'move', {
+            originalFileId: originalId,
+            newFileId: newId,
             metadata: finalMetadata
         });
 
-        console.log(`File move operation from ${originalFileId} to ${newFileId} recorded with ID: ${operationId}`);
+        console.log(`File move operation from ${originalId} to ${newId} recorded with ID: ${operationId}`);
         return { success: true, operationId };
-    } catch (error) {
-        console.error('Error recording move file operation:', error);
-        return { success: false, error: error.message };
-    }
+    }, context, originalFileId, newFileId, newMetadata);
 }
 
 /**
@@ -233,14 +422,37 @@ export async function moveFileInIndex(context, originalFileId, newFileId, newMet
  * @returns {Object} 返回操作结果 { operationId, totalProcessed }
  */
 export async function batchMoveFilesInIndex(context, moveOperations) {
-    try {
-        const { env } = context;
+    return indexOperationMiddleware(async (ctx, operations) => {
+        const { env } = ctx;
         const db = getDatabase(env);
+
+        // 验证输入
+        if (!Array.isArray(operations) || operations.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No move operations to process'
+            };
+        }
 
         // 处理每个移动操作的metadata
         const processedOperations = [];
-        for (const operation of moveOperations) {
+        for (const operation of operations) {
             const { originalFileId, newFileId, metadata } = operation;
+
+            // 验证文件ID
+            if (!originalFileId || !newFileId || 
+                typeof originalFileId !== 'string' || 
+                typeof newFileId !== 'string') {
+                console.warn('Skipping invalid move operation:', operation);
+                continue;
+            }
+
+            if (originalFileId === newFileId) {
+                console.warn('Skipping move operation with same IDs:', operation);
+                continue;
+            }
 
             // 确定最终的metadata
             let finalMetadata = metadata;
@@ -262,25 +474,29 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
             });
         }
 
+        if (processedOperations.length === 0) {
+            return {
+                success: true,
+                operationId: null,
+                totalProcessed: 0,
+                message: 'No valid move operations to process'
+            };
+        }
+
         // 记录批量移动操作
-        const operationId = await recordOperation(context, 'batch_move', {
+        const operationId = await recordOperation(ctx, 'batch_move', {
             operations: processedOperations
         });
 
-        console.log(`Batch move operation recorded with ID: ${operationId}, ${moveOperations.length} operations`);
+        console.log(`Batch move operation recorded with ID: ${operationId}, ${processedOperations.length} operations`);
         return {
             success: true,
             operationId,
-            totalProcessed: moveOperations.length
+            totalProcessed: processedOperations.length,
+            originalCount: operations.length,
+            validCount: processedOperations.length
         };
-    } catch (error) {
-        console.error('Error recording batch move files operation:', error);
-        return {
-            success: false,
-            error: error.message,
-            totalProcessed: 0
-        };
-    }
+    }, context, moveOperations);
 }
 
 /**
@@ -291,14 +507,14 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
  * @returns {Object} 合并结果
  */
 export async function mergeOperationsToIndex(context, options = {}) {
-    const { request } = context;
-    const { cleanupAfterMerge = true } = options;
-    
-    try {
+    return indexOperationMiddleware(async (ctx, opts) => {
+        const { request } = ctx;
+        const { cleanupAfterMerge = true } = opts;
+        
         console.log('Starting operations merge...');
         
         // 获取当前索引
-        const currentIndex = await getIndex(context);
+        const currentIndex = await getIndex(ctx);
         if (currentIndex.success === false) {
             console.error('Failed to get current index for merge');
             return {
@@ -308,7 +524,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
         }
 
         // 获取所有待处理的操作
-        const operationsResult = await getAllPendingOperations(context, currentIndex.lastOperationId);
+        const operationsResult = await getAllPendingOperations(ctx, currentIndex.lastOperationId);
 
         const operations = operationsResult.operations;
         const isALLOperations = operationsResult.isAll;
@@ -322,7 +538,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
             };
         }
 
-        console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isALLOperations}, if there are remaining operations they will be processed in the next merge.`);
+        console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isALLOperations}`);
 
         // 按时间戳排序操作，确保按正确顺序应用
         operations.sort((a, b) => a.timestamp - b.timestamp);
@@ -401,7 +617,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
             }
 
             // 保存更新后的索引（使用分块格式）
-            const saveSuccess = await saveChunkedIndex(context, workingIndex);
+            const saveSuccess = await saveChunkedIndex(ctx, workingIndex);
             if (!saveSuccess) {
                 console.error('Failed to save chunked index');
                 return {
@@ -415,22 +631,29 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
         // 清理已处理的操作记录
         if (cleanupAfterMerge && processedOperationIds.length > 0) {
-            await cleanupOperations(context, processedOperationIds);
+            await cleanupOperations(ctx, processedOperationIds);
         }
 
         // 如果未处理完所有操作，调用 merge-operations API 递归处理
         if (!isALLOperations) {
             console.log('There are remaining operations, will process them in subsequent calls.');
 
-            const headers = new Headers(request.headers);
-            const originUrl = new URL(request.url);
-            const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
+            if (request) {
+                const headers = new Headers(request.headers);
+                const originUrl = new URL(request.url);
+                const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
 
-            await fetch(mergeUrl, { method: 'GET', headers });
+                await fetch(mergeUrl, { method: 'GET', headers });
+            }
 
             return {
                 success: false,
-                error: 'There are remaining operations, will process them in subsequent calls.'
+                error: 'There are remaining operations, will process them in subsequent calls.',
+                processedOperations: operationsProcessed,
+                addedCount,
+                updatedCount,
+                removedCount,
+                movedCount
             };
         }
 
@@ -446,14 +669,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
 
         console.log('Operations merge completed:', result);
         return result;
-
-    } catch (error) {
-        console.error('Error merging operations:', error);
-        return {
-            success: false,
-            error: error.message
-        };
-    }
+    }, context, options);
 }
 
 /**
@@ -470,9 +686,11 @@ export async function mergeOperationsToIndex(context, options = {}) {
  * @param {Array<string>} options.excludeTags - 必须排除的标签数组
  * @param {boolean} options.countOnly - 仅返回总数
  * @param {boolean} options.includeSubdirFiles - 是否包含子目录下的文件
+ * @param {string} options.sortBy - 排序字段
+ * @param {string} options.sortOrder - 排序顺序
  */
 export async function readIndex(context, options = {}) {
-    try {
+    return indexOperationMiddleware(async (ctx, opts) => {
         const {
             search = '',
             directory = '',
@@ -483,158 +701,101 @@ export async function readIndex(context, options = {}) {
             includeTags = [],
             excludeTags = [],
             countOnly = false,
-            includeSubdirFiles = false
-        } = options;
+            includeSubdirFiles = false,
+            sortBy = 'TimeStamp',
+            sortOrder = 'desc'
+        } = opts;
+        
         // 处理目录满足无头有尾的格式，根目录为空
         const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
 
         // 处理挂起的操作
-        const mergeResult = await mergeOperationsToIndex(context);
-        if (!mergeResult.success) {
-            throw new Error('Failed to merge operations: ' + mergeResult.error);
+        const mergeResult = await mergeOperationsToIndex(ctx);
+        if (!mergeResult.success && mergeResult.error !== 'No pending operations') {
+            console.warn('Merge operations failed but continuing with read:', mergeResult.error);
         }
 
         // 获取当前索引
-        const index = await getIndex(context);
+        const index = await getIndex(ctx);
         if (!index.success) {
             throw new Error('Failed to get index');
         }
 
+        // 创建查询缓存键
+        const cacheKey = JSON.stringify({
+            search, directory, channel, listType,
+            includeTags, excludeTags, sortBy, sortOrder
+        });
+        
+        // 检查查询缓存
+        if (!countOnly && queryCache[cacheKey]) {
+            const cached = queryCache[cacheKey];
+            if (Date.now() - cached.timestamp < QUERY_CACHE_TTL) {
+                // 从缓存中获取并分页
+                const resultFiles = cached.data.slice(start, start + count);
+                return {
+                    ...cached.metadata,
+                    files: resultFiles,
+                    returnedCount: resultFiles.length,
+                    fromCache: true,
+                    success: true
+                };
+            }
+        }
+
         let filteredFiles = index.files;
 
-        // 目录过滤
-        if (directory) {
-            const normalizedDir = directory.endsWith('/') ? directory : directory + '/';
-            filteredFiles = filteredFiles.filter(file => {
-                const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-                return fileDir.startsWith(normalizedDir) || file.metadata.Directory === directory;
-            });
-        }
+        // 应用所有过滤器
+        filteredFiles = applyFilters(filteredFiles, {
+            directory: dirPrefix,
+            channel,
+            listType,
+            includeTags,
+            excludeTags,
+            search
+        });
 
-        // 渠道过滤
-        if (channel) {
-            filteredFiles = filteredFiles.filter(file => 
-                file.metadata.Channel?.toLowerCase() === channel.toLowerCase()
-            );
-        }
-
-        // 列表类型过滤
-        if (listType) {
-            filteredFiles = filteredFiles.filter(file => 
-                file.metadata.ListType === listType
-            );
-        }
-
-        // 标签过滤（独立于搜索关键字）
-        if (includeTags.length > 0 || excludeTags.length > 0) {
-            filteredFiles = filteredFiles.filter(file => {
-                const fileTags = (file.metadata.Tags || []).map(t => t.toLowerCase());
-
-                // 检查必须包含的标签
-                if (includeTags.length > 0) {
-                    const hasAllIncludeTags = includeTags.every(tag => 
-                        fileTags.includes(tag.toLowerCase())
-                    );
-                    if (!hasAllIncludeTags) {
-                        return false;
-                    }
-                }
-
-                // 检查必须排除的标签
-                if (excludeTags.length > 0) {
-                    const hasAnyExcludeTag = excludeTags.some(tag => 
-                        fileTags.includes(tag.toLowerCase())
-                    );
-                    if (hasAnyExcludeTag) {
-                        return false;
-                    }
-                }
-
-                return true;
-            });
-        }
-
-        // 搜索过滤（仅关键字）
-        if (search) {
-            const searchLower = search.toLowerCase();
-            filteredFiles = filteredFiles.filter(file => {
-                const matchesKeyword =
-                    file.metadata.FileName?.toLowerCase().includes(searchLower) ||
-                    file.id.toLowerCase().includes(searchLower);
-                return matchesKeyword;
-            });
-        }
+        // 排序
+        filteredFiles = sortFiles(filteredFiles, sortBy, sortOrder);
 
         // 如果只需要总数
         if (countOnly) {
             return {
                 totalCount: filteredFiles.length,
-                indexLastUpdated: index.lastUpdated
+                indexLastUpdated: index.lastUpdated,
+                success: true
             };
         }
 
+        // 计算统计信息
+        const stats = calculateDirectoryStats(filteredFiles, dirPrefix, includeSubdirFiles);
+
         // 分页处理
-        const totalCount = filteredFiles.length;
+        const resultFiles = filteredFiles.slice(start, start + count);
 
-        let resultFiles = filteredFiles;
-
-        // 计算当前目录下的直接文件（不包含子目录文件）
-        const directFiles = filteredFiles.filter(file => {
-            const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-            return fileDir === dirPrefix;
-        });
-        const directFileCount = directFiles.length;
-
-        // 如果不包含子目录文件，获取当前目录下的直接文件
-        if (!includeSubdirFiles) {
-            resultFiles = directFiles;
+        // 缓存结果
+        if (filteredFiles.length > 0 && !countOnly) {
+            queryCache[cacheKey] = {
+                data: filteredFiles,
+                metadata: {
+                    ...stats,
+                    indexLastUpdated: index.lastUpdated
+                },
+                timestamp: Date.now()
+            };
+            
+            // 限制缓存大小
+            limitCacheSize(queryCache, MAX_QUERY_CACHE_SIZE);
         }
-
-        if (count !== -1) {
-            const startIndex = Math.max(0, start);
-            const endIndex = startIndex + Math.max(1, count);
-            resultFiles = resultFiles.slice(startIndex, endIndex);
-        }
-
-        // 提取目录信息
-        const directories = new Set();
-        filteredFiles.forEach(file => {
-            const fileDir = file.metadata.Directory ? file.metadata.Directory : extractDirectory(file.id);
-            if (fileDir && fileDir.startsWith(dirPrefix)) {
-                const relativePath = fileDir.substring(dirPrefix.length);
-                const firstSlashIndex = relativePath.indexOf('/');
-                if (firstSlashIndex !== -1) {
-                    const subDir = dirPrefix + relativePath.substring(0, firstSlashIndex);
-                    directories.add(subDir);
-                }
-            }
-        });
-
-        // 直接子文件夹数目
-        const directFolderCount = directories.size;
 
         return {
             files: resultFiles,
-            directories: Array.from(directories),
-            totalCount: totalCount,
-            directFileCount: directFileCount,
-            directFolderCount: directFolderCount,
-            indexLastUpdated: index.lastUpdated,
+            ...stats,
             returnedCount: resultFiles.length,
-            success: true
+            success: true,
+            fromCache: false
         };
-
-    } catch (error) {
-        console.error('Error reading index:', error);
-        return {
-            files: [],
-            directories: [],
-            totalCount: 0,
-            indexLastUpdated: Date.now(),
-            returnedCount: 0,
-            success: false,
-        };
-    }
+    }, context, options);
 }
 
 /**
@@ -643,10 +804,10 @@ export async function readIndex(context, options = {}) {
  * @param {Function} progressCallback - 进度回调函数
  */
 export async function rebuildIndex(context, progressCallback = null) {
-    const { env, waitUntil } = context;
-    const db = getDatabase(env);
+    return indexOperationMiddleware(async (ctx, progressCb) => {
+        const { env, waitUntil } = ctx;
+        const db = getDatabase(env);
 
-    try {
         console.log('Starting index rebuild...');
         
         let cursor = null;
@@ -688,8 +849,8 @@ export async function rebuildIndex(context, progressCallback = null) {
                 processedCount++;
 
                 // 报告进度
-                if (progressCallback && processedCount % 100 === 0) {
-                    progressCallback(processedCount);
+                if (progressCb && processedCount % 100 === 0) {
+                    progressCb(processedCount);
                 }
             }
 
@@ -705,19 +866,23 @@ export async function rebuildIndex(context, progressCallback = null) {
         newIndex.totalCount = newIndex.files.length;
 
         // 保存新索引（使用分块格式）
-        const saveSuccess = await saveChunkedIndex(context, newIndex);
+        const saveSuccess = await saveChunkedIndex(ctx, newIndex);
         if (!saveSuccess) {
             console.error('Failed to save chunked index during rebuild');
             return {
                 success: false,
-                error: 'Failed to save rebuilt index'
+                error: 'Failed to save rebuilt index',
+                processedCount
             };
         }
 
         // 清除旧的操作记录和多余索引
-        waitUntil(deleteAllOperations(context));
-        waitUntil(clearChunkedIndex(context, true));
+        waitUntil(deleteAllOperations(ctx));
+        waitUntil(clearChunkedIndex(ctx, true));
 
+        // 清除缓存
+        clearIndexCache();
+        clearQueryCache();
 
         console.log(`Index rebuild completed. Processed ${processedCount} files, indexed ${newIndex.totalCount} files.`);
         return {
@@ -725,14 +890,7 @@ export async function rebuildIndex(context, progressCallback = null) {
             processedCount,
             indexedCount: newIndex.totalCount
         };
-        
-    } catch (error) {
-        console.error('Error rebuilding index:', error);
-        return {
-            success: false,
-            error: error.message
-        };
-    }
+    }, context, progressCallback);
 }
 
 /**
@@ -790,7 +948,10 @@ export async function getIndexInfo(context) {
         };
     } catch (error) {
         console.error('Error getting index info:', error);
-        return null;
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
@@ -827,11 +988,55 @@ export async function getIndexMeta(context) {
         console.error('Error getting index meta:', error);
         return {
             success: false,
+            error: error.message,
             totalCount: 0,
             totalSizeMB: 0,
             channelStats: {}
         };
     }
+}
+
+/**
+ * 获取索引统计信息
+ * @returns {Object} 统计信息
+ */
+export function getIndexStats() {
+    const avgDuration = indexStats.totalOperations > 0 
+        ? indexStats.totalDuration / indexStats.totalOperations 
+        : 0;
+    
+    return {
+        ...indexStats,
+        averageDuration: avgDuration,
+        errorRate: indexStats.totalOperations > 0 
+            ? (indexStats.errors / indexStats.totalOperations) * 100 
+            : 0
+    };
+}
+
+/**
+ * 清除索引缓存
+ */
+export function clearIndexCache() {
+    indexCache.data = null;
+    indexCache.timestamp = 0;
+}
+
+/**
+ * 清除查询缓存
+ */
+export function clearQueryCache() {
+    Object.keys(queryCache).forEach(key => {
+        delete queryCache[key];
+    });
+}
+
+/**
+ * 清除所有缓存
+ */
+export function clearAllCaches() {
+    clearIndexCache();
+    clearQueryCache();
 }
 
 /* ============= 原子操作相关函数 ============= */
@@ -992,7 +1197,7 @@ function applyMoveOperation(index, data) {
 }
 
 /**
- * 应用批量添加操作
+ * 应用批量添加操作 - 使用映射提高查找效率
  * @param {Object} index - 索引对象
  * @param {Object} data - 操作数据
  */
@@ -1009,6 +1214,10 @@ function applyBatchAddOperation(index, data) {
         existingFilesMap.set(file.id, idx);
     });
     
+    // 分离新增和更新的文件
+    const newFiles = [];
+    const updateFiles = [];
+    
     for (const fileData of files) {
         const { fileId, metadata } = fileData;
         const fileItem = {
@@ -1020,20 +1229,31 @@ function applyBatchAddOperation(index, data) {
         
         if (existingIndex !== undefined) {
             if (!skipExisting) {
-                // 更新现有文件
-                index.files[existingIndex] = fileItem;
+                updateFiles.push({ index: existingIndex, file: fileItem });
                 updatedCount++;
             }
         } else {
-            // 添加新文件
-            insertFileInOrder(index.files, fileItem);
-            // 更新映射
-            index.files.forEach((file, idx) => {
-                existingFilesMap.set(file.id, idx);
-            });
-            
+            newFiles.push(fileItem);
             addedCount++;
         }
+    }
+    
+    // 批量更新现有文件
+    updateFiles.forEach(({ index, file }) => {
+        index.files[index] = file;
+    });
+    
+    // 批量插入新文件（保持排序）
+    if (newFiles.length > 0) {
+        // 先对新文件按时间戳排序
+        newFiles.sort((a, b) => {
+            const aTime = a.metadata.TimeStamp || 0;
+            const bTime = b.metadata.TimeStamp || 0;
+            return bTime - aTime; // 倒序
+        });
+        
+        // 合并两个有序数组
+        index.files = mergeSortedArrays(index.files, newFiles);
     }
     
     return { addedCount, updatedCount };
@@ -1133,6 +1353,10 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
 
     } catch (error) {
         console.error('Error cleaning up operations:', error);
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
@@ -1142,10 +1366,10 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
  * @returns {Object} 删除结果 { success, deletedCount, errors?, totalFound? }
  */
 export async function deleteAllOperations(context) {
-    const { request, env } = context;
-    const db = getDatabase(env);
-    
-    try {
+    return indexOperationMiddleware(async (ctx) => {
+        const { request, env } = ctx;
+        const db = getDatabase(env);
+        
         console.log('Starting to delete all atomic operations...');
         
         // 获取所有原子操作
@@ -1187,43 +1411,64 @@ export async function deleteAllOperations(context) {
         const toDeleteOperationIds = allOperationIds.slice(0, MAX_DELETE_BATCH);
    
         // 批量删除原子操作
-        const cleanupResult = await cleanupOperations(context, toDeleteOperationIds);
+        const cleanupResult = await cleanupOperations(ctx, toDeleteOperationIds);
 
         // 剩余未删除的操作，调用 delete-operations API 进行递归删除
         if (allOperationIds.length > MAX_DELETE_BATCH || cleanupResult.errorCount > 0) {
             console.warn(`Too many operations (${allOperationIds.length}), only deleting first ${cleanupResult.deletedCount}. The remaining operations will be deleted in subsequent calls.`);
             // 复制请求头，用于鉴权
-            const headers = new Headers(request.headers);
+            if (request) {
+                const headers = new Headers(request.headers);
+                const originUrl = new URL(request.url);
+                const deleteUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=delete-operations`
+                
+                await fetch(deleteUrl, {
+                    method: 'GET',
+                    headers: headers
+                });
+            }
 
-            const originUrl = new URL(request.url);
-            const deleteUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=delete-operations`
-            
-            await fetch(deleteUrl, {
-                method: 'GET',
-                headers: headers
-            });
-
+            return {
+                success: false,
+                error: 'There are remaining operations, will process them in subsequent calls.',
+                deletedCount: cleanupResult.deletedCount,
+                totalFound: totalFound,
+                remainingCount: allOperationIds.length - cleanupResult.deletedCount
+            };
         } else {
             console.log(`Delete all operations completed`);
+            return {
+                success: true,
+                deletedCount: cleanupResult.deletedCount,
+                totalFound: totalFound,
+                message: 'All operations deleted successfully'
+            };
         }
-
-    } catch (error) {
-        console.error('Error deleting all operations:', error);
-    }
+    }, context);
 }
 
 /* ============= 工具函数 ============= */
 
 /**
- * 获取索引（内部函数）
+ * 获取索引（带缓存）
  * @param {Object} context - 上下文对象
  */
 async function getIndex(context) {
     const { waitUntil } = context;
+    
+    // 检查缓存是否有效
+    const now = Date.now();
+    if (indexCache.data && now - indexCache.timestamp < CACHE_TTL) {
+        return { ...indexCache.data };
+    }
+    
     try {
         // 首先尝试加载分块索引
         const index = await loadChunkedIndex(context);
         if (index.success) {
+            // 更新缓存
+            indexCache.data = index;
+            indexCache.timestamp = now;
             return index;
         } else {
             // 如果加载失败，触发重建索引
@@ -1299,17 +1544,32 @@ function insertFileInOrder(sortedFiles, fileItem) {
  * 并发控制工具函数 - 限制同时执行的Promise数量
  * @param {Array} tasks - 任务数组，每个任务是一个返回Promise的函数
  * @param {number} concurrency - 并发数量
+ * @param {Object} options - 选项
+ * @param {boolean} options.failFast - 是否快速失败，默认为 false
  * @returns {Promise<Array>} 所有任务的结果数组
  */
-async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
+async function promiseLimit(tasks, concurrency = BATCH_SIZE, options = {}) {
+    const { failFast = false } = options;
     const results = [];
     const executing = [];
+    let errorOccurred = false;
     
     for (let i = 0; i < tasks.length; i++) {
+        if (errorOccurred && failFast) {
+            results[i] = { error: 'Operation cancelled due to previous error' };
+            continue;
+        }
+        
         const task = tasks[i];
         const promise = Promise.resolve().then(() => task()).then(result => {
-            results[i] = result;
+            results[i] = { success: true, result };
             return result;
+        }).catch(error => {
+            results[i] = { success: false, error: error.message };
+            if (failFast) {
+                errorOccurred = true;
+            }
+            return null;
         }).finally(() => {
             const index = executing.indexOf(promise);
             if (index >= 0) {
@@ -1326,6 +1586,13 @@ async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
     
     // 等待所有剩余的Promise完成
     await Promise.all(executing);
+    
+    // 如果有错误且不是快速失败，检查所有结果
+    if (!failFast && results.some(r => !r.success)) {
+        const errors = results.filter(r => !r.success).map(r => r.error);
+        throw new Error(`Some operations failed: ${errors.join(', ')}`);
+    }
+    
     return results;
 }
 
@@ -1471,10 +1738,10 @@ async function loadChunkedIndex(context) {
  * @returns {Promise<boolean>} 是否清理成功
  */
 export async function clearChunkedIndex(context, onlyNonUsed = false) {
-    const { env } = context;
-    const db = getDatabase(env);
-    
-    try {
+    return indexOperationMiddleware(async (ctx, onlyNonUsedFlag) => {
+        const { env } = ctx;
+        const db = getDatabase(env);
+        
         console.log('Starting chunked index cleanup...');
         
         // 获取元数据
@@ -1485,7 +1752,7 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
             const metadata = JSON.parse(metadataStr);
             chunkCount = metadata.chunkCount || 0;
 
-            if (!onlyNonUsed) {
+            if (!onlyNonUsedFlag) {
                 // 删除元数据
                 await db.delete(INDEX_META_KEY).catch(() => {});
             }
@@ -1510,7 +1777,7 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
         }
 
         const reservedChunks = [];
-        if (onlyNonUsed) {
+        if (onlyNonUsedFlag) {
             // 如果仅清理未使用的分块索引，保留当前在使用的分块
             for (let chunkId = 0; chunkId < chunkCount; chunkId++) {
                 reservedChunks.push(`${INDEX_KEY}_${chunkId}`);
@@ -1538,12 +1805,12 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
         await Promise.all(deletePromises);
         
         console.log(`Chunked index cleanup completed. Attempted to delete ${chunkCount} chunks.`);
-        return true;
-        
-    } catch (error) {
-        console.error('Error during chunked index cleanup:', error);
-        return false;
-    }
+        return {
+            success: true,
+            deletedChunks: deletePromises.length,
+            reservedChunks: reservedChunks.length
+        };
+    }, context, onlyNonUsed);
 }
 
 /**
@@ -1603,4 +1870,192 @@ export async function getIndexStorageStats(context) {
             isChunked: false
         };
     }
+}
+
+/**
+ * 应用所有过滤器
+ * @param {Array} files - 文件数组
+ * @param {Object} filters - 过滤条件
+ * @returns {Array} 过滤后的文件数组
+ */
+function applyFilters(files, filters) {
+    const { directory, channel, listType, includeTags, excludeTags, search } = filters;
+    
+    return files.filter(file => {
+        // 目录过滤
+        if (directory) {
+            const fileDir = file.metadata.Directory || extractDirectory(file.id);
+            if (!fileDir.startsWith(directory)) {
+                return false;
+            }
+        }
+
+        // 渠道过滤
+        if (channel) {
+            if (file.metadata.Channel?.toLowerCase() !== channel.toLowerCase()) {
+                return false;
+            }
+        }
+
+        // 列表类型过滤
+        if (listType) {
+            if (file.metadata.ListType !== listType) {
+                return false;
+            }
+        }
+
+        // 标签过滤
+        if (includeTags.length > 0 || excludeTags.length > 0) {
+            const fileTags = (file.metadata.Tags || []).map(t => t.toLowerCase());
+            
+            // 必须包含的标签
+            if (includeTags.length > 0) {
+                const hasAll = includeTags.every(tag => 
+                    fileTags.includes(tag.toLowerCase())
+                );
+                if (!hasAll) return false;
+            }
+            
+            // 必须排除的标签
+            if (excludeTags.length > 0) {
+                const hasAny = excludeTags.some(tag => 
+                    fileTags.includes(tag.toLowerCase())
+                );
+                if (hasAny) return false;
+            }
+        }
+
+        // 搜索过滤
+        if (search) {
+            const searchLower = search.toLowerCase();
+            const matches = 
+                file.metadata.FileName?.toLowerCase().includes(searchLower) ||
+                file.id.toLowerCase().includes(searchLower);
+            if (!matches) return false;
+        }
+
+        return true;
+    });
+}
+
+/**
+ * 排序文件数组
+ * @param {Array} files - 文件数组
+ * @param {string} sortBy - 排序字段
+ * @param {string} sortOrder - 排序顺序
+ * @returns {Array} 排序后的文件数组
+ */
+function sortFiles(files, sortBy, sortOrder) {
+    return [...files].sort((a, b) => {
+        let aValue, bValue;
+        
+        switch (sortBy) {
+            case 'FileName':
+                aValue = a.metadata.FileName?.toLowerCase() || '';
+                bValue = b.metadata.FileName?.toLowerCase() || '';
+                break;
+            case 'Size':
+                aValue = parseFloat(a.metadata.FileSize) || 0;
+                bValue = parseFloat(b.metadata.FileSize) || 0;
+                break;
+            case 'Channel':
+                aValue = a.metadata.Channel?.toLowerCase() || '';
+                bValue = b.metadata.Channel?.toLowerCase() || '';
+                break;
+            case 'TimeStamp':
+            default:
+                aValue = a.metadata.TimeStamp || 0;
+                bValue = b.metadata.TimeStamp || 0;
+        }
+        
+        if (aValue < bValue) return sortOrder === 'asc' ? -1 : 1;
+        if (aValue > bValue) return sortOrder === 'asc' ? 1 : -1;
+        return 0;
+    });
+}
+
+/**
+ * 计算目录统计信息
+ * @param {Array} files - 文件数组
+ * @param {string} dirPrefix - 目录前缀
+ * @param {boolean} includeSubdirFiles - 是否包含子目录文件
+ * @returns {Object} 统计信息
+ */
+function calculateDirectoryStats(files, dirPrefix, includeSubdirFiles) {
+    // 计算当前目录下的直接文件
+    const directFiles = files.filter(file => {
+        const fileDir = file.metadata.Directory || extractDirectory(file.id);
+        return fileDir === dirPrefix;
+    });
+    const directFileCount = directFiles.length;
+
+    // 提取目录信息
+    const directories = new Set();
+    files.forEach(file => {
+        const fileDir = file.metadata.Directory || extractDirectory(file.id);
+        if (fileDir && fileDir.startsWith(dirPrefix)) {
+            const relativePath = fileDir.substring(dirPrefix.length);
+            const firstSlashIndex = relativePath.indexOf('/');
+            if (firstSlashIndex !== -1) {
+                const subDir = dirPrefix + relativePath.substring(0, firstSlashIndex);
+                directories.add(subDir);
+            }
+        }
+    });
+
+    // 直接子文件夹数目
+    const directFolderCount = directories.size;
+
+    return {
+        directories: Array.from(directories),
+        totalCount: files.length,
+        directFileCount: directFileCount,
+        directFolderCount: directFolderCount
+    };
+}
+
+/**
+ * 限制缓存大小
+ * @param {Object} cache - 缓存对象
+ * @param {number} maxSize - 最大大小
+ */
+function limitCacheSize(cache, maxSize) {
+    const keys = Object.keys(cache);
+    if (keys.length > maxSize) {
+        // 按时间戳排序，删除最旧的
+        const sortedKeys = keys.sort((a, b) => cache[a].timestamp - cache[b].timestamp);
+        const keysToRemove = sortedKeys.slice(0, keys.length - maxSize);
+        
+        keysToRemove.forEach(key => {
+            delete cache[key];
+        });
+    }
+}
+
+/**
+ * 合并两个已排序的文件数组（按时间戳倒序）
+ * @param {Array} arr1 - 第一个有序数组
+ * @param {Array} arr2 - 第二个有序数组
+ * @returns {Array} 合并后的有序数组
+ */
+function mergeSortedArrays(arr1, arr2) {
+    const result = [];
+    let i = 0, j = 0;
+    
+    while (i < arr1.length && j < arr2.length) {
+        const time1 = arr1[i].metadata.TimeStamp || 0;
+        const time2 = arr2[j].metadata.TimeStamp || 0;
+        
+        if (time1 >= time2) {
+            result.push(arr1[i++]);
+        } else {
+            result.push(arr2[j++]);
+        }
+    }
+    
+    // 添加剩余元素
+    while (i < arr1.length) result.push(arr1[i++]);
+    while (j < arr2.length) result.push(arr2[j++]);
+    
+    return result;
 }
