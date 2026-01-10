@@ -27,25 +27,51 @@ const memoryCache = new Map();
 class D1Database {
     constructor(db) {
         this.db = db;
+        
+        // 手动包装所有方法的错误处理
+        this.putFile = wrapWithErrorHandling(this.putFile.bind(this), 'putFile');
+        this.getFile = wrapWithErrorHandling(this.getFile.bind(this), 'getFile');
+        this.getFileWithMetadata = wrapWithErrorHandling(this.getFileWithMetadata.bind(this), 'getFileWithMetadata');
+        this.deleteFile = wrapWithErrorHandling(this.deleteFile.bind(this), 'deleteFile');
+        this.listFiles = wrapWithErrorHandling(this.listFiles.bind(this), 'listFiles');
+        this.putSetting = wrapWithErrorHandling(this.putSetting.bind(this), 'putSetting');
+        this.getSetting = wrapWithErrorHandling(this.getSetting.bind(this), 'getSetting');
+        this.deleteSetting = wrapWithErrorHandling(this.deleteSetting.bind(this), 'deleteSetting');
+        this.listSettings = wrapWithErrorHandling(this.listSettings.bind(this), 'listSettings');
+        this.putIndexOperation = wrapWithErrorHandling(this.putIndexOperation.bind(this), 'putIndexOperation');
+        this.getIndexOperation = wrapWithErrorHandling(this.getIndexOperation.bind(this), 'getIndexOperation');
+        this.deleteIndexOperation = wrapWithErrorHandling(this.deleteIndexOperation.bind(this), 'deleteIndexOperation');
+        this.listIndexOperations = wrapWithErrorHandling(this.listIndexOperations.bind(this), 'listIndexOperations');
+        this.markIndexOperationProcessed = wrapWithErrorHandling(this.markIndexOperationProcessed.bind(this), 'markIndexOperationProcessed');
+        this.put = wrapWithErrorHandling(this.put.bind(this), 'put');
+        this.get = wrapWithErrorHandling(this.get.bind(this), 'get');
+        this.getWithMetadata = wrapWithErrorHandling(this.getWithMetadata.bind(this), 'getWithMetadata');
+        this.delete = wrapWithErrorHandling(this.delete.bind(this), 'delete');
+        this.list = wrapWithErrorHandling(this.list.bind(this), 'list');
+        this.transaction = wrapWithErrorHandling(this.transaction.bind(this), 'transaction');
+        this.batch = wrapWithErrorHandling(this.batch.bind(this), 'batch');
     }
 }
 
-// 错误处理装饰器
-function handleDatabaseError(target, propertyKey, descriptor) {
-    const originalMethod = descriptor.value;
-    
-    descriptor.value = async function(...args) {
+/**
+ * 错误处理包装函数
+ * @param {Function} method - 要包装的方法
+ * @param {String} methodName - 方法名称
+ * @returns {Function} 包装后的方法
+ */
+function wrapWithErrorHandling(method, methodName) {
+    return async function(...args) {
         try {
-            return await originalMethod.apply(this, args);
+            return await method.apply(this, args);
         } catch (error) {
             const errorDetails = {
-                method: propertyKey,
+                method: methodName,
                 args: args,
                 error: error.message,
                 stack: error.stack
             };
             
-            console.error(`Database error in ${propertyKey}:`, errorDetails);
+            console.error(`Database error in ${methodName}:`, errorDetails);
             
             throw new DatabaseError(
                 `Database operation failed: ${error.message}`,
@@ -55,8 +81,6 @@ function handleDatabaseError(target, propertyKey, descriptor) {
             );
         }
     };
-    
-    return descriptor;
 }
 
 // ==================== 文件操作 ====================
@@ -64,7 +88,7 @@ function handleDatabaseError(target, propertyKey, descriptor) {
 /**
  * 保存文件记录 (替代 KV.put)
  */
-D1Database.prototype.putFile = handleDatabaseError(async function(fileId, value, options) {
+D1Database.prototype.putFile = async function(fileId, value, options) {
     this.validateFileId(fileId);
     
     value = value || '';
@@ -108,12 +132,12 @@ D1Database.prototype.putFile = handleDatabaseError(async function(fileId, value,
     cacheSet('FILES', fileId, { value, metadata });
     
     return result;
-});
+};
 
 /**
  * 获取文件记录 (替代 KV.get)
  */
-D1Database.prototype.getFile = handleDatabaseError(async function(fileId) {
+D1Database.prototype.getFile = async function(fileId) {
     this.validateFileId(fileId);
     
     // 尝试从缓存获取
@@ -139,19 +163,19 @@ D1Database.prototype.getFile = handleDatabaseError(async function(fileId) {
     cacheSet('FILES', fileId, file);
     
     return file;
-});
+};
 
 /**
  * 获取文件记录包含元数据 (替代 KV.getWithMetadata)
  */
-D1Database.prototype.getFileWithMetadata = handleDatabaseError(async function(fileId) {
+D1Database.prototype.getFileWithMetadata = async function(fileId) {
     return this.getFile(fileId);
-});
+};
 
 /**
  * 删除文件记录 (替代 KV.delete)
  */
-D1Database.prototype.deleteFile = handleDatabaseError(async function(fileId) {
+D1Database.prototype.deleteFile = async function(fileId) {
     this.validateFileId(fileId);
     
     var stmt = this.db.prepare('DELETE FROM files WHERE id = ?');
@@ -161,12 +185,12 @@ D1Database.prototype.deleteFile = handleDatabaseError(async function(fileId) {
     cacheDelete('FILES', fileId);
     
     return result;
-});
+};
 
 /**
  * 列出文件 (替代 KV.list)
  */
-D1Database.prototype.listFiles = handleDatabaseError(async function(options) {
+D1Database.prototype.listFiles = async function(options) {
     options = options || {};
     var prefix = options.prefix || '';
     var limit = options.limit || 1000;
@@ -213,14 +237,14 @@ D1Database.prototype.listFiles = handleDatabaseError(async function(options) {
         cursor: hasMore && keys.length > 0 ? keys[keys.length - 1].name : null,
         list_complete: !hasMore
     };
-});
+};
 
 // ==================== 设置操作 ====================
 
 /**
  * 保存设置 (替代 KV.put)
  */
-D1Database.prototype.putSetting = handleDatabaseError(async function(key, value, category) {
+D1Database.prototype.putSetting = async function(key, value, category) {
     if (!key || typeof key !== 'string') {
         throw new DatabaseError('Invalid setting key', 'INVALID_SETTING_KEY', 400);
     }
@@ -239,12 +263,12 @@ D1Database.prototype.putSetting = handleDatabaseError(async function(key, value,
     cacheSet('SETTINGS', key, value);
     
     return result;
-});
+};
 
 /**
  * 获取设置 (替代 KV.get)
  */
-D1Database.prototype.getSetting = handleDatabaseError(async function(key) {
+D1Database.prototype.getSetting = async function(key) {
     if (!key || typeof key !== 'string') {
         throw new DatabaseError('Invalid setting key', 'INVALID_SETTING_KEY', 400);
     }
@@ -266,12 +290,12 @@ D1Database.prototype.getSetting = handleDatabaseError(async function(key) {
     }
     
     return value;
-});
+};
 
 /**
  * 删除设置 (替代 KV.delete)
  */
-D1Database.prototype.deleteSetting = handleDatabaseError(async function(key) {
+D1Database.prototype.deleteSetting = async function(key) {
     if (!key || typeof key !== 'string') {
         throw new DatabaseError('Invalid setting key', 'INVALID_SETTING_KEY', 400);
     }
@@ -283,12 +307,12 @@ D1Database.prototype.deleteSetting = handleDatabaseError(async function(key) {
     cacheDelete('SETTINGS', key);
     
     return result;
-});
+};
 
 /**
  * 列出设置 (替代 KV.list)
  */
-D1Database.prototype.listSettings = handleDatabaseError(async function(options) {
+D1Database.prototype.listSettings = async function(options) {
     options = options || {};
     var prefix = options.prefix || '';
     var limit = options.limit || 1000;
@@ -319,14 +343,14 @@ D1Database.prototype.listSettings = handleDatabaseError(async function(options) 
     });
 
     return { keys: keys };
-});
+};
 
 // ==================== 索引操作 ====================
 
 /**
  * 保存索引操作记录
  */
-D1Database.prototype.putIndexOperation = handleDatabaseError(async function(operationId, operation) {
+D1Database.prototype.putIndexOperation = async function(operationId, operation) {
     if (!operationId || typeof operationId !== 'string') {
         throw new DatabaseError('Invalid operation ID', 'INVALID_OPERATION_ID', 400);
     }
@@ -355,12 +379,12 @@ D1Database.prototype.putIndexOperation = handleDatabaseError(async function(oper
     cacheSet('INDEX_OPERATIONS', operationId, operation);
     
     return result;
-});
+};
 
 /**
  * 获取索引操作记录
  */
-D1Database.prototype.getIndexOperation = handleDatabaseError(async function(operationId) {
+D1Database.prototype.getIndexOperation = async function(operationId) {
     if (!operationId || typeof operationId !== 'string') {
         throw new DatabaseError('Invalid operation ID', 'INVALID_OPERATION_ID', 400);
     }
@@ -387,12 +411,12 @@ D1Database.prototype.getIndexOperation = handleDatabaseError(async function(oper
     cacheSet('INDEX_OPERATIONS', operationId, operation);
     
     return operation;
-});
+};
 
 /**
  * 删除索引操作记录
  */
-D1Database.prototype.deleteIndexOperation = handleDatabaseError(async function(operationId) {
+D1Database.prototype.deleteIndexOperation = async function(operationId) {
     if (!operationId || typeof operationId !== 'string') {
         throw new DatabaseError('Invalid operation ID', 'INVALID_OPERATION_ID', 400);
     }
@@ -404,12 +428,12 @@ D1Database.prototype.deleteIndexOperation = handleDatabaseError(async function(o
     cacheDelete('INDEX_OPERATIONS', operationId);
     
     return result;
-});
+};
 
 /**
  * 列出索引操作记录
  */
-D1Database.prototype.listIndexOperations = handleDatabaseError(async function(options) {
+D1Database.prototype.listIndexOperations = async function(options) {
     options = options || {};
     var limit = options.limit || 1000;
     var processed = options.processed;
@@ -442,12 +466,12 @@ D1Database.prototype.listIndexOperations = handleDatabaseError(async function(op
             processed: row.processed
         };
     });
-});
+};
 
 /**
  * 标记索引操作已处理
  */
-D1Database.prototype.markIndexOperationProcessed = handleDatabaseError(async function(operationId) {
+D1Database.prototype.markIndexOperationProcessed = async function(operationId) {
     if (!operationId || typeof operationId !== 'string') {
         throw new DatabaseError('Invalid operation ID', 'INVALID_OPERATION_ID', 400);
     }
@@ -466,7 +490,7 @@ D1Database.prototype.markIndexOperationProcessed = handleDatabaseError(async fun
     }
     
     return result;
-});
+};
 
 // ==================== 工具方法 ====================
 
@@ -540,7 +564,7 @@ D1Database.prototype.validateMetadata = function(metadata) {
 /**
  * 通用的put方法，根据key类型自动选择存储位置
  */
-D1Database.prototype.put = handleDatabaseError(async function(key, value, options) {
+D1Database.prototype.put = async function(key, value, options) {
     options = options || {};
 
     if (key.startsWith('manage@sysConfig@')) {
@@ -552,12 +576,12 @@ D1Database.prototype.put = handleDatabaseError(async function(key, value, option
     } else {
         return this.putFile(key, value, options);
     }
-});
+};
 
 /**
  * 通用的get方法，根据key类型自动选择获取位置
  */
-D1Database.prototype.get = handleDatabaseError(async function(key) {
+D1Database.prototype.get = async function(key) {
     if (key.startsWith('manage@sysConfig@')) {
         return this.getSetting(key);
     } else if (key.startsWith('manage@index@operation_')) {
@@ -568,24 +592,24 @@ D1Database.prototype.get = handleDatabaseError(async function(key) {
         const file = await this.getFile(key);
         return file ? file.value : null;
     }
-});
+};
 
 /**
  * 通用的getWithMetadata方法
  */
-D1Database.prototype.getWithMetadata = handleDatabaseError(async function(key) {
+D1Database.prototype.getWithMetadata = async function(key) {
     if (key.startsWith('manage@sysConfig@')) {
         const value = await this.getSetting(key);
         return value ? { value: value, metadata: {} } : null;
     } else {
         return this.getFileWithMetadata(key);
     }
-});
+};
 
 /**
  * 通用的delete方法
  */
-D1Database.prototype.delete = handleDatabaseError(async function(key) {
+D1Database.prototype.delete = async function(key) {
     if (key.startsWith('manage@sysConfig@')) {
         return this.deleteSetting(key);
     } else if (key.startsWith('manage@index@operation_')) {
@@ -594,12 +618,12 @@ D1Database.prototype.delete = handleDatabaseError(async function(key) {
     } else {
         return this.deleteFile(key);
     }
-});
+};
 
 /**
  * 通用的list方法
  */
-D1Database.prototype.list = handleDatabaseError(async function(options) {
+D1Database.prototype.list = async function(options) {
     options = options || {};
     var prefix = options.prefix || '';
 
@@ -616,12 +640,12 @@ D1Database.prototype.list = handleDatabaseError(async function(options) {
     } else {
         return this.listFiles(options);
     }
-});
+};
 
 /**
  * 执行事务
  */
-D1Database.prototype.transaction = handleDatabaseError(async function(operations) {
+D1Database.prototype.transaction = async function(operations) {
     if (!Array.isArray(operations) || operations.length === 0) {
         throw new DatabaseError('Invalid operations array', 'INVALID_OPERATIONS', 400);
     }
@@ -648,14 +672,14 @@ D1Database.prototype.transaction = handleDatabaseError(async function(operations
         // 如果需要真正的事务支持，需要使用D1的事务API
         throw error;
     }
-});
+};
 
 /**
  * 批量操作
  */
-D1Database.prototype.batch = handleDatabaseError(async function(operations) {
+D1Database.prototype.batch = async function(operations) {
     return this.transaction(operations);
-});
+};
 
 /**
  * 清除缓存
