@@ -40,28 +40,85 @@
 import { getDatabase } from './databaseAdapter.js';
 import { matchesTags } from './tagHelpers.js';
 
+// ==========================================
+// 常量定义
+// ==========================================
+
 const INDEX_KEY = 'manage@index';
 const INDEX_META_KEY = 'manage@index@meta'; // 索引元数据键
 const OPERATION_KEY_PREFIX = 'manage@index@operation_';
 const INDEX_CHUNK_SIZE = 10000; // 索引分块大小
 const KV_LIST_LIMIT = 1000; // 数据库列出批量大小
 const BATCH_SIZE = 10; // 批量处理大小
+const MAX_OPERATION_COUNT = 30; // 单次获取的最大操作数量
+const MAX_DELETE_BATCH = 40; // 单次删除的最大操作数量
+
+// ==========================================
+// 类型定义
+// ==========================================
+
+/**
+ * @typedef {Object} IndexFile
+ * @property {string} id - 文件ID
+ * @property {Object} metadata - 文件元数据
+ */
+
+/**
+ * @typedef {Object} Index
+ * @property {IndexFile[]} files - 文件数组
+ * @property {number} lastUpdated - 最后更新时间戳
+ * @property {number} totalCount - 文件总数
+ * @property {string|null} lastOperationId - 最后处理的操作ID
+ * @property {boolean} success - 是否成功获取索引
+ */
+
+/**
+ * @typedef {Object} Operation
+ * @property {string} id - 操作ID
+ * @property {string} type - 操作类型
+ * @property {number} timestamp - 时间戳
+ * @property {Object} data - 操作数据
+ */
+
+/**
+ * @typedef {Object} IndexOptions
+ * @property {string} [search=''] - 搜索关键字
+ * @property {string} [directory=''] - 目录过滤
+ * @property {number} [start=0] - 起始位置
+ * @property {number} [count=50] - 返回数量，-1 表示返回所有
+ * @property {string} [channel=''] - 渠道过滤
+ * @property {string} [listType=''] - 列表类型过滤
+ * @property {string[]} [includeTags=[]] - 必须包含的标签数组
+ * @property {string[]} [excludeTags=[]] - 必须排除的标签数组
+ * @property {boolean} [countOnly=false] - 仅返回总数
+ * @property {boolean} [includeSubdirFiles=false] - 是否包含子目录下的文件
+ */
+
+// ==========================================
+// 索引操作函数
+// ==========================================
 
 /**
  * 添加文件到索引
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @param {string} fileId - 文件 ID
- * @param {Object} metadata - 文件元数据
+ * @param {Object} [metadata=null] - 文件元数据
+ * @returns {Promise<Object>} 操作结果
  */
 export async function addFileToIndex(context, fileId, metadata = null) {
     const { env } = context;
     const db = getDatabase(env);
 
     try {
+        // 参数验证
+        if (!fileId || typeof fileId !== 'string') {
+            throw new Error('Invalid file ID');
+        }
+
         if (metadata === null) {
             // 如果未传入metadata，尝试从数据库中获取
             const fileData = await db.getWithMetadata(fileId);
-            metadata = fileData.metadata || {};
+            metadata = fileData?.metadata || {};
         }
 
         // 记录原子操作
@@ -73,7 +130,7 @@ export async function addFileToIndex(context, fileId, metadata = null) {
         console.log(`File ${fileId} add operation recorded with ID: ${operationId}`);
         return { success: true, operationId };
     } catch (error) {
-        console.error('Error recording add file operation:', error);
+        console.error(`Error recording add file operation for ${fileId}:`, error);
         return { success: false, error: error.message };
     }
 }
@@ -82,9 +139,9 @@ export async function addFileToIndex(context, fileId, metadata = null) {
  * 批量添加文件到索引
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @param {Array} files - 文件数组，每个元素包含 { fileId, metadata }
- * @param {Object} options - 选项
- * @param {boolean} options.skipExisting - 是否跳过已存在的文件，默认为 false（更新已存在的文件）
- * @returns {Object} 返回操作结果 { operationId, totalProcessed }
+ * @param {Object} [options={}] - 选项
+ * @param {boolean} [options.skipExisting=false] - 是否跳过已存在的文件，默认为 false（更新已存在的文件）
+ * @returns {Promise<Object>} 返回操作结果 { operationId, totalProcessed }
  */
 export async function batchAddFilesToIndex(context, files, options = {}) {
     try {
@@ -92,17 +149,29 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
         const { skipExisting = false } = options;
         const db = getDatabase(env);
 
+        // 参数验证
+        if (!Array.isArray(files) || files.length === 0) {
+            throw new Error('Invalid files array');
+        }
+
         // 处理每个文件的metadata
         const processedFiles = [];
         for (const fileItem of files) {
             const { fileId, metadata } = fileItem;
+            
+            // 参数验证
+            if (!fileId || typeof fileId !== 'string') {
+                console.warn(`Skipping invalid file ID: ${fileId}`);
+                continue;
+            }
+
             let finalMetadata = metadata;
 
             // 如果没有提供metadata，尝试从数据库中获取
             if (!finalMetadata) {
                 try {
                     const fileData = await db.getWithMetadata(fileId);
-                    finalMetadata = fileData.metadata || {};
+                    finalMetadata = fileData?.metadata || {};
                 } catch (error) {
                     console.warn(`Failed to get metadata for file ${fileId}:`, error);
                     finalMetadata = {};
@@ -115,17 +184,21 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
             });
         }
 
+        if (processedFiles.length === 0) {
+            throw new Error('No valid files to process');
+        }
+
         // 记录批量添加操作
         const operationId = await recordOperation(context, 'batch_add', {
             files: processedFiles,
             options: { skipExisting }
         });
 
-        console.log(`Batch add operation recorded with ID: ${operationId}, ${files.length} files`);
+        console.log(`Batch add operation recorded with ID: ${operationId}, ${processedFiles.length} files`);
         return {
             success: true,
             operationId,
-            totalProcessed: files.length
+            totalProcessed: processedFiles.length
         };
     } catch (error) {
         console.error('Error recording batch add files operation:', error);
@@ -141,9 +214,15 @@ export async function batchAddFilesToIndex(context, files, options = {}) {
  * 从索引中删除文件
  * @param {Object} context - 上下文对象
  * @param {string} fileId - 文件 ID
+ * @returns {Promise<Object>} 操作结果
  */
 export async function removeFileFromIndex(context, fileId) {
     try {
+        // 参数验证
+        if (!fileId || typeof fileId !== 'string') {
+            throw new Error('Invalid file ID');
+        }
+
         // 记录删除操作
         const operationId = await recordOperation(context, 'remove', {
             fileId
@@ -152,7 +231,7 @@ export async function removeFileFromIndex(context, fileId) {
         console.log(`File ${fileId} remove operation recorded with ID: ${operationId}`);
         return { success: true, operationId };
     } catch (error) {
-        console.error('Error recording remove file operation:', error);
+        console.error(`Error recording remove file operation for ${fileId}:`, error);
         return { success: false, error: error.message };
     }
 }
@@ -161,19 +240,38 @@ export async function removeFileFromIndex(context, fileId) {
  * 批量删除文件
  * @param {Object} context - 上下文对象
  * @param {Array} fileIds - 文件 ID 数组
+ * @returns {Promise<Object>} 操作结果
  */
 export async function batchRemoveFilesFromIndex(context, fileIds) {
     try {
-        // 记录批量删除操作
-        const operationId = await recordOperation(context, 'batch_remove', {
-            fileIds
+        // 参数验证
+        if (!Array.isArray(fileIds) || fileIds.length === 0) {
+            throw new Error('Invalid file IDs array');
+        }
+
+        // 验证每个文件ID
+        const validFileIds = fileIds.filter(fileId => {
+            if (!fileId || typeof fileId !== 'string') {
+                console.warn(`Skipping invalid file ID: ${fileId}`);
+                return false;
+            }
+            return true;
         });
 
-        console.log(`Batch remove operation recorded with ID: ${operationId}, ${fileIds.length} files`);
+        if (validFileIds.length === 0) {
+            throw new Error('No valid file IDs to process');
+        }
+
+        // 记录批量删除操作
+        const operationId = await recordOperation(context, 'batch_remove', {
+            fileIds: validFileIds
+        });
+
+        console.log(`Batch remove operation recorded with ID: ${operationId}, ${validFileIds.length} files`);
         return {
             success: true,
             operationId,
-            totalProcessed: fileIds.length
+            totalProcessed: validFileIds.length
         };
     } catch (error) {
         console.error('Error recording batch remove files operation:', error);
@@ -190,13 +288,24 @@ export async function batchRemoveFilesFromIndex(context, fileIds) {
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @param {string} originalFileId - 原文件 ID
  * @param {string} newFileId - 新文件 ID
- * @param {Object} newMetadata - 新的元数据，如果为null则获取原文件的metadata
- * @returns {Object} 返回操作结果 { success, operationId?, error? }
+ * @param {Object} [newMetadata=null] - 新的元数据，如果为null则获取原文件的metadata
+ * @returns {Promise<Object>} 返回操作结果 { success, operationId?, error? }
  */
 export async function moveFileInIndex(context, originalFileId, newFileId, newMetadata = null) {
     try {
         const { env } = context;
         const db = getDatabase(env);
+
+        // 参数验证
+        if (!originalFileId || typeof originalFileId !== 'string') {
+            throw new Error('Invalid original file ID');
+        }
+        if (!newFileId || typeof newFileId !== 'string') {
+            throw new Error('Invalid new file ID');
+        }
+        if (originalFileId === newFileId) {
+            throw new Error('Original and new file IDs are the same');
+        }
 
         // 确定最终的metadata
         let finalMetadata = newMetadata;
@@ -204,7 +313,7 @@ export async function moveFileInIndex(context, originalFileId, newFileId, newMet
             // 如果没有提供新metadata，尝试从数据库中获取
             try {
                 const fileData = await db.getWithMetadata(newFileId);
-                finalMetadata = fileData.metadata || {};
+                finalMetadata = fileData?.metadata || {};
             } catch (error) {
                 console.warn(`Failed to get metadata for new file ${newFileId}:`, error);
                 finalMetadata = {};
@@ -221,7 +330,7 @@ export async function moveFileInIndex(context, originalFileId, newFileId, newMet
         console.log(`File move operation from ${originalFileId} to ${newFileId} recorded with ID: ${operationId}`);
         return { success: true, operationId };
     } catch (error) {
-        console.error('Error recording move file operation:', error);
+        console.error(`Error recording move file operation from ${originalFileId} to ${newFileId}:`, error);
         return { success: false, error: error.message };
     }
 }
@@ -230,17 +339,36 @@ export async function moveFileInIndex(context, originalFileId, newFileId, newMet
  * 批量移动文件
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @param {Array} moveOperations - 移动操作数组，每个元素包含 { originalFileId, newFileId, metadata? }
- * @returns {Object} 返回操作结果 { operationId, totalProcessed }
+ * @returns {Promise<Object>} 返回操作结果 { operationId, totalProcessed }
  */
 export async function batchMoveFilesInIndex(context, moveOperations) {
     try {
         const { env } = context;
         const db = getDatabase(env);
 
+        // 参数验证
+        if (!Array.isArray(moveOperations) || moveOperations.length === 0) {
+            throw new Error('Invalid move operations array');
+        }
+
         // 处理每个移动操作的metadata
         const processedOperations = [];
         for (const operation of moveOperations) {
             const { originalFileId, newFileId, metadata } = operation;
+            
+            // 参数验证
+            if (!originalFileId || typeof originalFileId !== 'string') {
+                console.warn(`Skipping invalid original file ID: ${originalFileId}`);
+                continue;
+            }
+            if (!newFileId || typeof newFileId !== 'string') {
+                console.warn(`Skipping invalid new file ID: ${newFileId}`);
+                continue;
+            }
+            if (originalFileId === newFileId) {
+                console.warn(`Skipping move operation where original and new file IDs are the same: ${originalFileId}`);
+                continue;
+            }
 
             // 确定最终的metadata
             let finalMetadata = metadata;
@@ -248,7 +376,7 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
                 // 如果没有提供新metadata，尝试从数据库中获取
                 try {
                     const fileData = await db.getWithMetadata(newFileId);
-                    finalMetadata = fileData.metadata || {};
+                    finalMetadata = fileData?.metadata || {};
                 } catch (error) {
                     console.warn(`Failed to get metadata for new file ${newFileId}:`, error);
                     finalMetadata = {};
@@ -262,16 +390,20 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
             });
         }
 
+        if (processedOperations.length === 0) {
+            throw new Error('No valid move operations to process');
+        }
+
         // 记录批量移动操作
         const operationId = await recordOperation(context, 'batch_move', {
             operations: processedOperations
         });
 
-        console.log(`Batch move operation recorded with ID: ${operationId}, ${moveOperations.length} operations`);
+        console.log(`Batch move operation recorded with ID: ${operationId}, ${processedOperations.length} operations`);
         return {
             success: true,
             operationId,
-            totalProcessed: moveOperations.length
+            totalProcessed: processedOperations.length
         };
     } catch (error) {
         console.error('Error recording batch move files operation:', error);
@@ -283,12 +415,16 @@ export async function batchMoveFilesInIndex(context, moveOperations) {
     }
 }
 
+// ==========================================
+// 索引管理函数
+// ==========================================
+
 /**
  * 合并所有挂起的操作到索引中
  * @param {Object} context - 上下文对象
- * @param {Object} options - 选项
- * @param {boolean} options.cleanupAfterMerge - 合并后是否清理操作记录，默认为 true
- * @returns {Object} 合并结果
+ * @param {Object} [options={}] - 选项
+ * @param {boolean} [options.cleanupAfterMerge=true] - 合并后是否清理操作记录，默认为 true
+ * @returns {Promise<Object>} 合并结果
  */
 export async function mergeOperationsToIndex(context, options = {}) {
     const { request } = context;
@@ -299,7 +435,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
         
         // 获取当前索引
         const currentIndex = await getIndex(context);
-        if (currentIndex.success === false) {
+        if (!currentIndex.success) {
             console.error('Failed to get current index for merge');
             return {
                 success: false,
@@ -311,7 +447,7 @@ export async function mergeOperationsToIndex(context, options = {}) {
         const operationsResult = await getAllPendingOperations(context, currentIndex.lastOperationId);
 
         const operations = operationsResult.operations;
-        const isALLOperations = operationsResult.isAll;
+        const isAllOperations = operationsResult.isAll;
 
         if (operations.length === 0) {
             console.log('No pending operations to merge');
@@ -322,13 +458,13 @@ export async function mergeOperationsToIndex(context, options = {}) {
             };
         }
 
-        console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isALLOperations}, if there are remaining operations they will be processed in the next merge.`);
+        console.log(`Found ${operations.length} pending operations to merge. Is all operations: ${isAllOperations}, if there are remaining operations they will be processed in the next merge.`);
 
         // 按时间戳排序操作，确保按正确顺序应用
         operations.sort((a, b) => a.timestamp - b.timestamp);
 
         // 创建索引的副本进行操作
-        const workingIndex = currentIndex;
+        const workingIndex = { ...currentIndex };
         let operationsProcessed = 0;
         let addedCount = 0;
         let removedCount = 0;
@@ -419,14 +555,16 @@ export async function mergeOperationsToIndex(context, options = {}) {
         }
 
         // 如果未处理完所有操作，调用 merge-operations API 递归处理
-        if (!isALLOperations) {
+        if (!isAllOperations) {
             console.log('There are remaining operations, will process them in subsequent calls.');
 
-            const headers = new Headers(request.headers);
-            const originUrl = new URL(request.url);
-            const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
+            if (request) {
+                const headers = new Headers(request.headers);
+                const originUrl = new URL(request.url);
+                const mergeUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=merge-operations`;
 
-            await fetch(mergeUrl, { method: 'GET', headers });
+                await fetchWithTimeout(mergeUrl, { method: 'GET', headers });
+            }
 
             return {
                 success: false,
@@ -459,17 +597,8 @@ export async function mergeOperationsToIndex(context, options = {}) {
 /**
  * 读取文件索引，支持搜索和分页
  * @param {Object} context - 上下文对象
- * @param {Object} options - 查询选项
- * @param {string} options.search - 搜索关键字
- * @param {string} options.directory - 目录过滤
- * @param {number} options.start - 起始位置
- * @param {number} options.count - 返回数量，-1 表示返回所有
- * @param {string} options.channel - 渠道过滤
- * @param {string} options.listType - 列表类型过滤
- * @param {Array<string>} options.includeTags - 必须包含的标签数组
- * @param {Array<string>} options.excludeTags - 必须排除的标签数组
- * @param {boolean} options.countOnly - 仅返回总数
- * @param {boolean} options.includeSubdirFiles - 是否包含子目录下的文件
+ * @param {IndexOptions} [options={}] - 查询选项
+ * @returns {Promise<Object>} 查询结果
  */
 export async function readIndex(context, options = {}) {
     try {
@@ -485,13 +614,15 @@ export async function readIndex(context, options = {}) {
             countOnly = false,
             includeSubdirFiles = false
         } = options;
+        
         // 处理目录满足无头有尾的格式，根目录为空
         const dirPrefix = directory === '' || directory.endsWith('/') ? directory : directory + '/';
 
         // 处理挂起的操作
         const mergeResult = await mergeOperationsToIndex(context);
-        if (!mergeResult.success) {
-            throw new Error('Failed to merge operations: ' + mergeResult.error);
+        if (!mergeResult.success && mergeResult.error !== 'No pending operations') {
+            console.warn('Failed to merge operations before read:', mergeResult.error);
+            // 继续执行，即使合并失败
         }
 
         // 获取当前索引
@@ -500,7 +631,7 @@ export async function readIndex(context, options = {}) {
             throw new Error('Failed to get index');
         }
 
-        let filteredFiles = index.files;
+        let filteredFiles = [...index.files];
 
         // 目录过滤
         if (directory) {
@@ -569,7 +700,8 @@ export async function readIndex(context, options = {}) {
         if (countOnly) {
             return {
                 totalCount: filteredFiles.length,
-                indexLastUpdated: index.lastUpdated
+                indexLastUpdated: index.lastUpdated,
+                success: true
             };
         }
 
@@ -633,6 +765,7 @@ export async function readIndex(context, options = {}) {
             indexLastUpdated: Date.now(),
             returnedCount: 0,
             success: false,
+            error: error.message
         };
     }
 }
@@ -640,7 +773,8 @@ export async function readIndex(context, options = {}) {
 /**
  * 重建索引（从数据库中的所有文件重新构建索引）
  * @param {Object} context - 上下文对象
- * @param {Function} progressCallback - 进度回调函数
+ * @param {Function} [progressCallback=null] - 进度回调函数
+ * @returns {Promise<Object>} 重建结果
  */
 export async function rebuildIndex(context, progressCallback = null) {
     const { env, waitUntil } = context;
@@ -738,13 +872,14 @@ export async function rebuildIndex(context, progressCallback = null) {
 /**
  * 获取索引信息
  * @param {Object} context - 上下文对象
+ * @returns {Promise<Object>} 索引信息
  */
 export async function getIndexInfo(context) {
     try {
         const index = await getIndex(context);
 
         // 检查索引是否成功获取
-        if (index.success === false) {
+        if (!index.success) {
             return {
                 success: false,
                 error: 'Failed to retrieve index',
@@ -790,7 +925,10 @@ export async function getIndexInfo(context) {
         };
     } catch (error) {
         console.error('Error getting index info:', error);
-        return null;
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
@@ -798,7 +936,7 @@ export async function getIndexInfo(context) {
  * 获取索引元数据（轻量级，只读取 meta，不读取整个索引）
  * 用于容量检查等场景，避免读取整个索引
  * @param {Object} context - 上下文对象
- * @returns {Object} 索引元数据，包含 totalCount, totalSizeMB, channelStats 等
+ * @returns {Promise<Object>} 索引元数据，包含 totalCount, totalSizeMB, channelStats 等
  */
 export async function getIndexMeta(context) {
     const { env } = context;
@@ -829,15 +967,19 @@ export async function getIndexMeta(context) {
             success: false,
             totalCount: 0,
             totalSizeMB: 0,
-            channelStats: {}
+            channelStats: {},
+            error: error.message
         };
     }
 }
 
-/* ============= 原子操作相关函数 ============= */
+// ==========================================
+// 原子操作相关函数
+// ==========================================
 
 /**
  * 生成唯一的操作ID
+ * @returns {string} 唯一的操作ID
  */
 function generateOperationId() {
     const timestamp = Date.now();
@@ -850,10 +992,16 @@ function generateOperationId() {
  * @param {Object} context - 上下文对象，包含 env 和其他信息
  * @param {string} type - 操作类型
  * @param {Object} data - 操作数据
+ * @returns {Promise<string>} 操作ID
  */
 async function recordOperation(context, type, data) {
     const { env } = context;
     const db = getDatabase(env);
+
+    // 参数验证
+    if (!type || !['add', 'remove', 'move', 'batch_add', 'batch_remove', 'batch_move'].includes(type)) {
+        throw new Error(`Invalid operation type: ${type}`);
+    }
 
     const operationId = generateOperationId();
     const operation = {
@@ -871,7 +1019,8 @@ async function recordOperation(context, type, data) {
 /**
  * 获取所有待处理的操作
  * @param {Object} context - 上下文对象
- * @param {string} lastOperationId - 最后处理的操作ID
+ * @param {string} [lastOperationId=null] - 最后处理的操作ID
+ * @returns {Promise<Object>} 待处理的操作
  */
 async function getAllPendingOperations(context, lastOperationId = null) {
     const { env } = context;
@@ -880,8 +1029,7 @@ async function getAllPendingOperations(context, lastOperationId = null) {
     const operations = [];
 
     let cursor = null;
-    const MAX_OPERATION_COUNT = 30; // 单次获取的最大操作数量
-    let isALL = true; // 是否获取了所有操作
+    let isAll = true; // 是否获取了所有操作
     let operationCount = 0;
 
     try {
@@ -899,7 +1047,7 @@ async function getAllPendingOperations(context, lastOperationId = null) {
                 }
                 
                 if (operationCount >= MAX_OPERATION_COUNT) {
-                    isALL = false; // 达到最大操作数量，停止获取
+                    isAll = false; // 达到最大操作数量，停止获取
                     break;
                 }
 
@@ -912,7 +1060,7 @@ async function getAllPendingOperations(context, lastOperationId = null) {
                         operationCount++;
                     }
                 } catch (error) {
-                    isALL = false;
+                    isAll = false;
                     console.warn(`Failed to parse operation ${item.name}:`, error);
                 }
             }
@@ -926,14 +1074,15 @@ async function getAllPendingOperations(context, lastOperationId = null) {
     
     return {
         operations,
-        isAll: isALL,
+        isAll,
     }
 }
 
 /**
  * 应用添加操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {Object} 操作结果
  */
 function applyAddOperation(index, data) {
     const { fileId, metadata } = data;
@@ -959,8 +1108,9 @@ function applyAddOperation(index, data) {
 
 /**
  * 应用删除操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {boolean} 是否成功删除
  */
 function applyRemoveOperation(index, data) {
     const { fileId } = data;
@@ -971,8 +1121,9 @@ function applyRemoveOperation(index, data) {
 
 /**
  * 应用移动操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {boolean} 是否成功移动
  */
 function applyMoveOperation(index, data) {
     const { originalFileId, newFileId, metadata } = data;
@@ -993,8 +1144,9 @@ function applyMoveOperation(index, data) {
 
 /**
  * 应用批量添加操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {Object} 操作结果
  */
 function applyBatchAddOperation(index, data) {
     const { files, options } = data;
@@ -1028,9 +1180,7 @@ function applyBatchAddOperation(index, data) {
             // 添加新文件
             insertFileInOrder(index.files, fileItem);
             // 更新映射
-            index.files.forEach((file, idx) => {
-                existingFilesMap.set(file.id, idx);
-            });
+            existingFilesMap.set(fileId, index.files.length - 1);
             
             addedCount++;
         }
@@ -1041,8 +1191,9 @@ function applyBatchAddOperation(index, data) {
 
 /**
  * 应用批量删除操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {number} 删除的文件数量
  */
 function applyBatchRemoveOperation(index, data) {
     const { fileIds } = data;
@@ -1056,8 +1207,9 @@ function applyBatchRemoveOperation(index, data) {
 
 /**
  * 应用批量移动操作
- * @param {Object} index - 索引对象
+ * @param {Index} index - 索引对象
  * @param {Object} data - 操作数据
+ * @returns {number} 移动的文件数量
  */
 function applyBatchMoveOperation(index, data) {
     const { operations } = data;
@@ -1095,7 +1247,8 @@ function applyBatchMoveOperation(index, data) {
  * 并发清理指定的原子操作记录
  * @param {Object} context - 上下文对象
  * @param {Array} operationIds - 要清理的操作ID数组
- * @param {number} concurrency - 并发数量，默认为10
+ * @param {number} [concurrency=10] - 并发数量，默认为10
+ * @returns {Promise<Object>} 清理结果
  */
 async function cleanupOperations(context, operationIds, concurrency = 10) {
     const { env } = context;
@@ -1133,13 +1286,17 @@ async function cleanupOperations(context, operationIds, concurrency = 10) {
 
     } catch (error) {
         console.error('Error cleaning up operations:', error);
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
 /**
  * 删除所有原子操作记录
  * @param {Object} context - 上下文对象，包含 env 和其他信息
- * @returns {Object} 删除结果 { success, deletedCount, errors?, totalFound? }
+ * @returns {Promise<Object>} 删除结果 { success, deletedCount, errors?, totalFound? }
  */
 export async function deleteAllOperations(context) {
     const { request, env } = context;
@@ -1183,7 +1340,6 @@ export async function deleteAllOperations(context) {
         console.log(`Found ${totalFound} atomic operations to delete`);
 
         // 限制单次删除的数量
-        const MAX_DELETE_BATCH = 40;
         const toDeleteOperationIds = allOperationIds.slice(0, MAX_DELETE_BATCH);
    
         // 批量删除原子操作
@@ -1192,147 +1348,47 @@ export async function deleteAllOperations(context) {
         // 剩余未删除的操作，调用 delete-operations API 进行递归删除
         if (allOperationIds.length > MAX_DELETE_BATCH || cleanupResult.errorCount > 0) {
             console.warn(`Too many operations (${allOperationIds.length}), only deleting first ${cleanupResult.deletedCount}. The remaining operations will be deleted in subsequent calls.`);
-            // 复制请求头，用于鉴权
-            const headers = new Headers(request.headers);
-
-            const originUrl = new URL(request.url);
-            const deleteUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=delete-operations`
             
-            await fetch(deleteUrl, {
-                method: 'GET',
-                headers: headers
-            });
+            if (request) {
+                // 复制请求头，用于鉴权
+                const headers = new Headers(request.headers);
+                const originUrl = new URL(request.url);
+                const deleteUrl = `${originUrl.protocol}//${originUrl.host}/api/manage/list?action=delete-operations`
+                
+                await fetchWithTimeout(deleteUrl, {
+                    method: 'GET',
+                    headers: headers
+                });
+            }
 
         } else {
             console.log(`Delete all operations completed`);
         }
 
+        return {
+            success: true,
+            deletedCount: cleanupResult.deletedCount,
+            totalFound: totalFound,
+            message: 'Operation deletion in progress'
+        };
+
     } catch (error) {
         console.error('Error deleting all operations:', error);
+        return {
+            success: false,
+            error: error.message
+        };
     }
 }
 
-/* ============= 工具函数 ============= */
-
-/**
- * 获取索引（内部函数）
- * @param {Object} context - 上下文对象
- */
-async function getIndex(context) {
-    const { waitUntil } = context;
-    try {
-        // 首先尝试加载分块索引
-        const index = await loadChunkedIndex(context);
-        if (index.success) {
-            return index;
-        } else {
-            // 如果加载失败，触发重建索引
-            waitUntil(rebuildIndex(context));
-        }
-    } catch (error) {
-        console.warn('Error reading index, creating new one:', error);
-        waitUntil(rebuildIndex(context));
-    }
-    
-    // 返回空的索引结构
-    return {
-        files: [],
-        lastUpdated: Date.now(),
-        totalCount: 0,
-        lastOperationId: null,
-        success: false,
-    };
-}
-
-/**
- * 从文件路径提取目录（内部函数）
- * @param {string} filePath - 文件路径
- */
-function extractDirectory(filePath) {
-    const lastSlashIndex = filePath.lastIndexOf('/');
-    if (lastSlashIndex === -1) {
-        return ''; // 根目录
-    }
-    return filePath.substring(0, lastSlashIndex + 1); // 包含最后的斜杠
-}
-
-/**
- * 将文件按时间戳倒序插入到已排序的数组中
- * @param {Array} sortedFiles - 已按时间戳倒序排序的文件数组
- * @param {Object} fileItem - 要插入的文件项
- */
-function insertFileInOrder(sortedFiles, fileItem) {
-    const fileTimestamp = fileItem.metadata.TimeStamp || 0;
-    
-    // 如果数组为空或新文件时间戳比第一个文件更新，直接插入到开头
-    if (sortedFiles.length === 0 || fileTimestamp >= (sortedFiles[0].metadata.TimeStamp || 0)) {
-        sortedFiles.unshift(fileItem);
-        return;
-    }
-    
-    // 如果新文件时间戳比最后一个文件更旧，直接添加到末尾
-    if (fileTimestamp <= (sortedFiles[sortedFiles.length - 1].metadata.TimeStamp || 0)) {
-        sortedFiles.push(fileItem);
-        return;
-    }
-    
-    // 使用二分查找找到正确的插入位置
-    let left = 0;
-    let right = sortedFiles.length;
-    
-    while (left < right) {
-        const mid = Math.floor((left + right) / 2);
-        const midTimestamp = sortedFiles[mid].metadata.TimeStamp || 0;
-        
-        if (fileTimestamp >= midTimestamp) {
-            right = mid;
-        } else {
-            left = mid + 1;
-        }
-    }
-    
-    // 在找到的位置插入文件
-    sortedFiles.splice(left, 0, fileItem);
-}
-
-/**
- * 并发控制工具函数 - 限制同时执行的Promise数量
- * @param {Array} tasks - 任务数组，每个任务是一个返回Promise的函数
- * @param {number} concurrency - 并发数量
- * @returns {Promise<Array>} 所有任务的结果数组
- */
-async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
-    const results = [];
-    const executing = [];
-    
-    for (let i = 0; i < tasks.length; i++) {
-        const task = tasks[i];
-        const promise = Promise.resolve().then(() => task()).then(result => {
-            results[i] = result;
-            return result;
-        }).finally(() => {
-            const index = executing.indexOf(promise);
-            if (index >= 0) {
-                executing.splice(index, 1);
-            }
-        });
-        
-        executing.push(promise);
-        
-        if (executing.length >= concurrency) {
-            await Promise.race(executing);
-        }
-    }
-    
-    // 等待所有剩余的Promise完成
-    await Promise.all(executing);
-    return results;
-}
+// ==========================================
+// 分块存储函数
+// ==========================================
 
 /**
  * 保存分块索引到数据库
  * @param {Object} context - 上下文对象，包含 env
- * @param {Object} index - 完整的索引对象
+ * @param {Index} index - 完整的索引对象
  * @returns {Promise<boolean>} 是否保存成功
  */
 async function saveChunkedIndex(context, index) {
@@ -1401,7 +1457,7 @@ async function saveChunkedIndex(context, index) {
 /**
  * 从数据库加载分块索引
  * @param {Object} context - 上下文对象，包含 env
- * @returns {Promise<Object>} 完整的索引对象
+ * @returns {Promise<Index>} 完整的索引对象
  */
 async function loadChunkedIndex(context) {
     const { env } = context;
@@ -1467,7 +1523,7 @@ async function loadChunkedIndex(context) {
 /**
  * 清理分块索引
  * @param {Object} context - 上下文对象，包含 env
- * @param {boolean} onlyNonUsed - 是否仅清理未使用的分块索引，默认为 false
+ * @param {boolean} [onlyNonUsed=false] - 是否仅清理未使用的分块索引，默认为 false
  * @returns {Promise<boolean>} 是否清理成功
  */
 export async function clearChunkedIndex(context, onlyNonUsed = false) {
@@ -1549,7 +1605,7 @@ export async function clearChunkedIndex(context, onlyNonUsed = false) {
 /**
  * 获取索引的存储统计信息
  * @param {Object} context - 上下文对象，包含 env
- * @returns {Object} 存储统计信息
+ * @returns {Promise<Object>} 存储统计信息
  */
 export async function getIndexStorageStats(context) {
     const { env } = context;
@@ -1602,5 +1658,156 @@ export async function getIndexStorageStats(context) {
             error: error.message,
             isChunked: false
         };
+    }
+}
+
+// ==========================================
+// 工具函数
+// ==========================================
+
+/**
+ * 获取索引（内部函数）
+ * @param {Object} context - 上下文对象
+ * @returns {Promise<Index>} 索引对象
+ */
+async function getIndex(context) {
+    const { waitUntil } = context;
+    try {
+        // 首先尝试加载分块索引
+        const index = await loadChunkedIndex(context);
+        if (index.success) {
+            return index;
+        } else {
+            // 如果加载失败，触发重建索引
+            waitUntil(rebuildIndex(context));
+        }
+    } catch (error) {
+        console.warn('Error reading index, creating new one:', error);
+        waitUntil(rebuildIndex(context));
+    }
+    
+    // 返回空的索引结构
+    return {
+        files: [],
+        lastUpdated: Date.now(),
+        totalCount: 0,
+        lastOperationId: null,
+        success: false,
+    };
+}
+
+/**
+ * 从文件路径提取目录（内部函数）
+ * @param {string} filePath - 文件路径
+ * @returns {string} 目录路径
+ */
+function extractDirectory(filePath) {
+    if (!filePath || typeof filePath !== 'string') return '';
+    
+    const lastSlashIndex = filePath.lastIndexOf('/');
+    if (lastSlashIndex === -1) {
+        return ''; // 根目录
+    }
+    return filePath.substring(0, lastSlashIndex + 1); // 包含最后的斜杠
+}
+
+/**
+ * 将文件按时间戳倒序插入到已排序的数组中
+ * @param {IndexFile[]} sortedFiles - 已按时间戳倒序排序的文件数组
+ * @param {IndexFile} fileItem - 要插入的文件项
+ */
+function insertFileInOrder(sortedFiles, fileItem) {
+    const fileTimestamp = fileItem.metadata.TimeStamp || 0;
+    
+    // 如果数组为空或新文件时间戳比第一个文件更新，直接插入到开头
+    if (sortedFiles.length === 0 || fileTimestamp >= (sortedFiles[0].metadata.TimeStamp || 0)) {
+        sortedFiles.unshift(fileItem);
+        return;
+    }
+    
+    // 如果新文件时间戳比最后一个文件更旧，直接添加到末尾
+    if (fileTimestamp <= (sortedFiles[sortedFiles.length - 1].metadata.TimeStamp || 0)) {
+        sortedFiles.push(fileItem);
+        return;
+    }
+    
+    // 使用二分查找找到正确的插入位置
+    let left = 0;
+    let right = sortedFiles.length;
+    
+    while (left < right) {
+        const mid = Math.floor((left + right) / 2);
+        const midTimestamp = sortedFiles[mid].metadata.TimeStamp || 0;
+        
+        if (fileTimestamp >= midTimestamp) {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+    }
+    
+    // 在找到的位置插入文件
+    sortedFiles.splice(left, 0, fileItem);
+}
+
+/**
+ * 并发控制工具函数 - 限制同时执行的Promise数量
+ * @param {Array} tasks - 任务数组，每个任务是一个返回Promise的函数
+ * @param {number} [concurrency=BATCH_SIZE] - 并发数量
+ * @returns {Promise<Array>} 所有任务的结果数组
+ */
+async function promiseLimit(tasks, concurrency = BATCH_SIZE) {
+    const results = [];
+    const executing = [];
+    
+    for (let i = 0; i < tasks.length; i++) {
+        const task = tasks[i];
+        const promise = Promise.resolve().then(() => task()).then(result => {
+            results[i] = result;
+            return result;
+        }).finally(() => {
+            const index = executing.indexOf(promise);
+            if (index >= 0) {
+                executing.splice(index, 1);
+            }
+        });
+        
+        executing.push(promise);
+        
+        if (executing.length >= concurrency) {
+            await Promise.race(executing);
+        }
+    }
+    
+    // 等待所有剩余的Promise完成
+    await Promise.all(executing);
+    return results;
+}
+
+/**
+ * 带超时的fetch函数
+ * @param {string} resource - 请求资源
+ * @param {Object} [options={}] - 请求选项
+ * @param {number} [options.timeout=8000] - 超时时间
+ * @returns {Promise<Response>} 请求响应
+ */
+async function fetchWithTimeout(resource, options = {}) {
+    const { timeout = 8000 } = options;
+    
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+        const response = await fetch(resource, {
+            ...options,
+            signal: controller.signal
+        });
+        clearTimeout(id);
+        return response;
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${timeout}ms`);
+        }
+        throw error;
     }
 }
