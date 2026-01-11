@@ -37,25 +37,48 @@ class KVROCKSAdapter {
         this.connectionString = connectionString;
         this.redis = null;
         this.connected = false;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 1000; // 1秒
     }
 
     /**
-     * 建立连接
+     * 建立连接（带重试机制）
      */
     async connect() {
-        if (!this.connected) {
+        if (this.connected && this.redis) {
             try {
-                this.redis = createRedis(this.connectionString);
-                // 测试连接
+                // 测试现有连接
                 await this.redis.send('PING');
-                this.connected = true;
-                console.log('Connected to KVROCKS successfully');
+                return this.redis;
             } catch (error) {
-                console.error('Failed to connect to KVROCKS:', error);
-                throw error;
+                console.warn('Existing connection failed, reconnecting...', error.message);
+                this.connected = false;
+                this.redis = null;
             }
         }
-        return this.redis;
+
+        while (this.reconnectAttempts < this.maxReconnectAttempts) {
+            try {
+                this.redis = createRedis(this.connectionString);
+                await this.redis.send('PING');
+                this.connected = true;
+                this.reconnectAttempts = 0; // 重置重试计数器
+                console.log('Connected to KVROCKS successfully');
+                return this.redis;
+            } catch (error) {
+                this.reconnectAttempts++;
+                console.error(`Failed to connect to KVROCKS (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}):`, error.message);
+                
+                if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+                    throw new Error(`Failed to connect to KVROCKS after ${this.maxReconnectAttempts} attempts: ${error.message}`);
+                }
+                
+                // 指数退避重试
+                const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
     }
 
     /**
@@ -74,38 +97,76 @@ class KVROCKSAdapter {
     }
 
     /**
-     * 保存键值对
+     * 保存键值对（使用事务确保原子性）
      */
     async put(key, value, options) {
         options = options || {};
         const redis = await this.connect();
         
         try {
+            // 使用MULTI确保操作原子性
+            const multi = redis.multi();
+            
+            // 保存主值
+            multi.send('SET', key, value);
+            
             // 处理元数据
             if (options.metadata) {
                 const metadataKey = `${key}:metadata`;
-                await redis.send('SET', metadataKey, JSON.stringify(options.metadata));
+                multi.send('SET', metadataKey, JSON.stringify(options.metadata));
             }
-            
-            // 保存主值
-            await redis.send('SET', key, value);
             
             // 处理过期时间
             if (options.expiration || options.expirationTtl) {
                 const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
                 if (ttl > 0) {
-                    await redis.send('EXPIRE', key, ttl);
+                    multi.send('EXPIRE', key, ttl);
                     if (options.metadata) {
                         const metadataKey = `${key}:metadata`;
-                        await redis.send('EXPIRE', metadataKey, ttl);
+                        multi.send('EXPIRE', metadataKey, ttl);
                     }
                 }
             }
             
+            // 执行事务
+            await multi.exec();
+            
             return { success: true };
         } catch (error) {
             console.error('KVROCKS put error:', error);
-            throw error;
+            
+            // 连接可能已断开，重置连接状态
+            this.connected = false;
+            
+            // 重试一次
+            try {
+                const redis = await this.connect();
+                const multi = redis.multi();
+                
+                multi.send('SET', key, value);
+                
+                if (options.metadata) {
+                    const metadataKey = `${key}:metadata`;
+                    multi.send('SET', metadataKey, JSON.stringify(options.metadata));
+                }
+                
+                if (options.expiration || options.expirationTtl) {
+                    const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
+                    if (ttl > 0) {
+                        multi.send('EXPIRE', key, ttl);
+                        if (options.metadata) {
+                            const metadataKey = `${key}:metadata`;
+                            multi.send('EXPIRE', metadataKey, ttl);
+                        }
+                    }
+                }
+                
+                await multi.exec();
+                return { success: true };
+            } catch (retryError) {
+                console.error('KVROCKS put retry failed:', retryError);
+                throw retryError;
+            }
         }
     }
 
@@ -119,6 +180,7 @@ class KVROCKSAdapter {
             return value === null ? null : value;
         } catch (error) {
             console.error('KVROCKS get error:', error);
+            this.connected = false;
             throw error;
         }
     }
@@ -144,24 +206,40 @@ class KVROCKSAdapter {
             };
         } catch (error) {
             console.error('KVROCKS getWithMetadata error:', error);
+            this.connected = false;
             throw error;
         }
     }
 
     /**
-     * 删除键
+     * 删除键（使用事务确保原子性）
      */
     async delete(key, options) {
         const redis = await this.connect();
         try {
-            await Promise.all([
-                redis.send('DEL', key),
-                redis.send('DEL', `${key}:metadata`)
-            ]);
+            // 使用MULTI确保操作原子性
+            const multi = redis.multi();
+            multi.send('DEL', key);
+            multi.send('DEL', `${key}:metadata`);
+            await multi.exec();
+            
             return { success: true };
         } catch (error) {
             console.error('KVROCKS delete error:', error);
-            throw error;
+            this.connected = false;
+            
+            // 重试一次
+            try {
+                const redis = await this.connect();
+                const multi = redis.multi();
+                multi.send('DEL', key);
+                multi.send('DEL', `${key}:metadata`);
+                await multi.exec();
+                return { success: true };
+            } catch (retryError) {
+                console.error('KVROCKS delete retry failed:', retryError);
+                throw retryError;
+            }
         }
     }
 
@@ -184,11 +262,19 @@ class KVROCKSAdapter {
             
             // 获取元数据
             const keysWithMetadata = await Promise.all(dataKeys.map(async key => {
-                const metadataJson = await redis.send('GET', `${key}:metadata`);
-                return {
-                    name: key,
-                    metadata: metadataJson ? JSON.parse(metadataJson) : {}
-                };
+                try {
+                    const metadataJson = await redis.send('GET', `${key}:metadata`);
+                    return {
+                        name: key,
+                        metadata: metadataJson ? JSON.parse(metadataJson) : {}
+                    };
+                } catch (metadataError) {
+                    console.warn(`Failed to get metadata for key ${key}:`, metadataError.message);
+                    return {
+                        name: key,
+                        metadata: {}
+                    };
+                }
             }));
             
             return {
@@ -198,6 +284,7 @@ class KVROCKSAdapter {
             };
         } catch (error) {
             console.error('KVROCKS list error:', error);
+            this.connected = false;
             throw error;
         }
     }
@@ -265,16 +352,20 @@ class KVROCKSAdapter {
         // 转换格式以匹配D1Database的返回格式
         const operations = [];
         for (const item of result.keys) {
-            const operationData = await this.get(item.name);
-            if (operationData) {
-                const operation = JSON.parse(operationData);
-                operations.push({
-                    id: item.name.replace('manage@index@operation_', ''),
-                    type: operation.type,
-                    timestamp: operation.timestamp,
-                    data: operation.data,
-                    processed: false // KVROCKS中没有这个字段，默认为false
-                });
+            try {
+                const operationData = await this.get(item.name);
+                if (operationData) {
+                    const operation = JSON.parse(operationData);
+                    operations.push({
+                        id: item.name.replace('manage@index@operation_', ''),
+                        type: operation.type,
+                        timestamp: operation.timestamp,
+                        data: operation.data,
+                        processed: false // KVROCKS中没有这个字段，默认为false
+                    });
+                }
+            } catch (error) {
+                console.warn(`Failed to process operation ${item.name}:`, error.message);
             }
         }
         
