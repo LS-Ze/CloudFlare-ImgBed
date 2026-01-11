@@ -111,16 +111,28 @@ class KVROCKSAdapter {
             
             // 执行事务命令
             const commands = [];
+            let commandsExecuted = false;
+            
             const sendCommand = (...args) => {
                 // 不允许在事务中执行PING命令
                 if (args[0].toUpperCase() === 'PING') {
                     throw new Error('PING command is not allowed in transactions');
                 }
                 commands.push(args);
+                commandsExecuted = true;
                 return redis.send(...args);
             };
             
+            // 执行事务函数
             await transaction(sendCommand);
+            
+            // 检查是否有命令被执行
+            if (!commandsExecuted) {
+                // 如果没有命令，回滚事务
+                await redis.send('DISCARD');
+                console.warn('Transaction aborted - no commands were executed');
+                return [];
+            }
             
             // 执行事务
             const results = await redis.send('EXEC');
@@ -165,8 +177,16 @@ class KVROCKSAdapter {
     async put(key, value, options) {
         options = options || {};
         
+        // 验证参数
+        if (!key || key.trim() === '') {
+            throw new Error('Key is required');
+        }
+        if (value === undefined || value === null) {
+            throw new Error('Value is required');
+        }
+        
         try {
-            await this.executeTransaction(async (send) => {
+            const results = await this.executeTransaction(async (send) => {
                 // 保存主值
                 await send('SET', key, value);
                 
@@ -189,9 +209,14 @@ class KVROCKSAdapter {
                 }
             });
             
+            // 检查结果
+            if (results.length === 0) {
+                throw new Error('No commands were executed in transaction');
+            }
+            
             return { success: true };
         } catch (error) {
-            console.error('KVROCKS put error:', error);
+            console.error(`KVROCKS put error for key "${key}":`, error);
             
             // 连接可能已断开，重置连接状态
             this.connected = false;
@@ -200,7 +225,7 @@ class KVROCKSAdapter {
             try {
                 return await this.put(key, value, options);
             } catch (retryError) {
-                console.error('KVROCKS put retry failed:', retryError);
+                console.error(`KVROCKS put retry failed for key "${key}":`, retryError);
                 throw retryError;
             }
         }
@@ -210,12 +235,16 @@ class KVROCKSAdapter {
      * 获取值
      */
     async get(key, options) {
+        if (!key || key.trim() === '') {
+            throw new Error('Key is required');
+        }
+        
         const redis = await this.connect();
         try {
             const value = await redis.send('GET', key);
             return value === null ? null : value;
         } catch (error) {
-            console.error('KVROCKS get error:', error);
+            console.error(`KVROCKS get error for key "${key}":`, error);
             this.connected = false;
             throw error;
         }
@@ -225,6 +254,10 @@ class KVROCKSAdapter {
      * 获取值和元数据
      */
     async getWithMetadata(key, options) {
+        if (!key || key.trim() === '') {
+            throw new Error('Key is required');
+        }
+        
         const redis = await this.connect();
         try {
             // 使用事务确保一致性
@@ -244,7 +277,7 @@ class KVROCKSAdapter {
                 metadata: metadataJson ? JSON.parse(metadataJson) : {}
             };
         } catch (error) {
-            console.error('KVROCKS getWithMetadata error:', error);
+            console.error(`KVROCKS getWithMetadata error for key "${key}":`, error);
             this.connected = false;
             throw error;
         }
@@ -254,6 +287,10 @@ class KVROCKSAdapter {
      * 删除键（使用事务确保原子性）
      */
     async delete(key, options) {
+        if (!key || key.trim() === '') {
+            throw new Error('Key is required');
+        }
+        
         try {
             await this.executeTransaction(async (send) => {
                 await send('DEL', key);
@@ -262,14 +299,14 @@ class KVROCKSAdapter {
             
             return { success: true };
         } catch (error) {
-            console.error('KVROCKS delete error:', error);
+            console.error(`KVROCKS delete error for key "${key}":`, error);
             this.connected = false;
             
             // 重试一次
             try {
                 return await this.delete(key, options);
             } catch (retryError) {
-                console.error('KVROCKS delete retry failed:', retryError);
+                console.error(`KVROCKS delete retry failed for key "${key}":`, retryError);
                 throw retryError;
             }
         }
