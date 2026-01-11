@@ -4,7 +4,7 @@
  */
 
 import { D1Database } from './d1Database.js';
-import { createRedis } from '@bitphinix/redis-on-workers';
+import { createRedis } from 'redis-on-workers';
 
 /**
  * 创建数据库适配器
