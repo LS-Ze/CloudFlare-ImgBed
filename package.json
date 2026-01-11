@@ -2,12 +2,17 @@
   "scripts": {
     "ci-test": "concurrently --kill-others \"npm start\" \"wait-on http://localhost:8080 && mocha\"",
     "test": "mocha",
-    "start": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data"
+    "start": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data",
+    "start:kvrocks": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data --var img_kvrocks=redis://your_username:your_password@tcp.ap-northeast-1.clawcloudrun.com:44837",
+    "deploy": "npx wrangler pages deploy",
+    "deploy:kvrocks": "npx wrangler pages deploy --var img_kvrocks=redis://your_username:your_password@tcp.ap-northeast-1.clawcloudrun.com:44837",
+    "build": "echo \"Build completed successfully\""
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.726.1",
     "@cloudflare/pages-plugin-sentry": "^1.1.3",
     "@sentry/tracing": "^7.114.0",
+    "@bitphinix/redis-on-workers": "^0.3.7",
     "miniflare": "^3.20240718.0"
   },
   "devDependencies": {
@@ -15,5 +20,8 @@
     "mocha": "^10.6.0",
     "wait-on": "^7.2.0",
     "wrangler": "^4.24.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
