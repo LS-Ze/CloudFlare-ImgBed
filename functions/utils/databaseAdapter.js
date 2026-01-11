@@ -48,7 +48,7 @@ class KVROCKSAdapter {
     async connect() {
         if (this.connected && this.redis) {
             try {
-                // 测试现有连接
+                // 测试现有连接（不在事务中执行）
                 await this.redis.send('PING');
                 return this.redis;
             } catch (error) {
@@ -61,7 +61,7 @@ class KVROCKSAdapter {
         while (this.reconnectAttempts < this.maxReconnectAttempts) {
             try {
                 this.redis = createRedis(this.connectionString);
-                // 测试连接
+                // 测试连接（不在事务中执行）
                 await this.redis.send('PING');
                 this.connected = true;
                 this.reconnectAttempts = 0; // 重置重试计数器
@@ -112,6 +112,10 @@ class KVROCKSAdapter {
             // 执行事务命令
             const commands = [];
             const sendCommand = (...args) => {
+                // 不允许在事务中执行PING命令
+                if (args[0].toUpperCase() === 'PING') {
+                    throw new Error('PING command is not allowed in transactions');
+                }
                 commands.push(args);
                 return redis.send(...args);
             };
@@ -124,6 +128,23 @@ class KVROCKSAdapter {
             // 检查事务是否被中止
             if (results === null) {
                 throw new Error('Transaction aborted - watched key was modified');
+            }
+            
+            // 检查每个命令的执行结果
+            for (let i = 0; i < results.length; i++) {
+                const result = results[i];
+                const command = commands[i];
+                
+                // 跳过成功的命令
+                if (result === 'OK' || result === true || typeof result === 'number') {
+                    continue;
+                }
+                
+                // 处理错误结果
+                if (result === null || result === false || 
+                    (typeof result === 'string' && result.startsWith('ERR '))) {
+                    throw new Error(`Transaction command failed: ${command[0]} ${command.slice(1).join(' ')} - Result: ${result}`);
+                }
             }
             
             return results;
@@ -145,7 +166,7 @@ class KVROCKSAdapter {
         options = options || {};
         
         try {
-            const results = await this.executeTransaction(async (send) => {
+            await this.executeTransaction(async (send) => {
                 // 保存主值
                 await send('SET', key, value);
                 
@@ -167,13 +188,6 @@ class KVROCKSAdapter {
                     }
                 }
             });
-            
-            // 检查结果
-            for (let i = 0; i < results.length; i++) {
-                if (results[i] === null || results[i] === false) {
-                    throw new Error(`Transaction command failed at index ${i}: ${results[i]}`);
-                }
-            }
             
             return { success: true };
         } catch (error) {
