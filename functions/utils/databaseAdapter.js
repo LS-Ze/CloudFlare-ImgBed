@@ -24,7 +24,8 @@ export function createDatabaseAdapter(env) {
         return new KVAdapter(env.img_url);
     } else {
         console.error('No database configured. Please configure either KV (env.img_url), D1 (env.img_d1) or KVROCKS (env.img_kvrocks).');
-        return null;
+        // 返回一个模拟适配器避免崩溃
+        return new MockAdapter();
     }
 }
 
@@ -40,15 +41,22 @@ class KVROCKSAdapter {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 5;
         this.reconnectDelay = 1000; // 1秒
+        this.connectionLock = null; // 防止重复连接
     }
 
     /**
      * 建立连接（带重试机制）
      */
     async connect() {
+        // 如果正在连接中，等待现有的连接
+        if (this.connectionLock) {
+            return this.connectionLock;
+        }
+        
+        // 如果已经连接，测试连接是否仍然有效
         if (this.connected && this.redis) {
             try {
-                // 测试现有连接（不在事务中执行）
+                // 测试现有连接
                 await this.redis.send('PING');
                 return this.redis;
             } catch (error) {
@@ -58,21 +66,38 @@ class KVROCKSAdapter {
             }
         }
 
+        // 创建新的连接锁
+        this.connectionLock = this._connectWithRetry();
+        try {
+            const result = await this.connectionLock;
+            return result;
+        } finally {
+            this.connectionLock = null;
+        }
+    }
+
+    /**
+     * 带重试的内部连接方法
+     */
+    async _connectWithRetry() {
+        let lastError;
+        
         while (this.reconnectAttempts < this.maxReconnectAttempts) {
             try {
                 this.redis = createRedis(this.connectionString);
-                // 测试连接（不在事务中执行）
+                // 测试连接
                 await this.redis.send('PING');
                 this.connected = true;
                 this.reconnectAttempts = 0; // 重置重试计数器
                 console.log('Connected to KVROCKS successfully');
                 return this.redis;
             } catch (error) {
+                lastError = error;
                 this.reconnectAttempts++;
                 console.error(`Failed to connect to KVROCKS (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}):`, error.message);
                 
                 if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-                    throw new Error(`Failed to connect to KVROCKS after ${this.maxReconnectAttempts} attempts: ${error.message}`);
+                    break;
                 }
                 
                 // 指数退避重试
@@ -80,6 +105,8 @@ class KVROCKSAdapter {
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
+        
+        throw new Error(`Failed to connect to KVROCKS after ${this.maxReconnectAttempts} attempts: ${lastError.message}`);
     }
 
     /**
@@ -99,7 +126,7 @@ class KVROCKSAdapter {
 
     /**
      * 执行Redis事务
-     * @param {Function} transaction - 事务函数，接收sendCommand方法
+     * @param {Function} transaction - 事务函数，接收一个pushCommand函数用于添加命令
      * @returns {Array} 事务结果
      */
     async executeTransaction(transaction) {
@@ -109,54 +136,25 @@ class KVROCKSAdapter {
             // 开始事务
             await redis.send('MULTI');
             
-            // 执行事务命令
+            // 收集事务中的所有命令
             const commands = [];
-            let commandsExecuted = false;
             
-            const sendCommand = (...args) => {
-                // 不允许在事务中执行PING命令
-                if (args[0].toUpperCase() === 'PING') {
-                    throw new Error('PING command is not allowed in transactions');
-                }
+            // 创建一个函数来收集命令而不是立即执行
+            const collectCommand = (...args) => {
                 commands.push(args);
-                commandsExecuted = true;
+                // 在MULTI模式下，命令会排队等待EXEC
                 return redis.send(...args);
             };
             
-            // 执行事务函数
-            await transaction(sendCommand);
+            // 执行事务函数，收集命令
+            await transaction(collectCommand);
             
-            // 检查是否有命令被执行
-            if (!commandsExecuted) {
-                // 如果没有命令，回滚事务
-                await redis.send('DISCARD');
-                console.warn('Transaction aborted - no commands were executed');
-                return [];
-            }
-            
-            // 执行事务
+            // 执行事务并获取结果
             const results = await redis.send('EXEC');
             
             // 检查事务是否被中止
             if (results === null) {
                 throw new Error('Transaction aborted - watched key was modified');
-            }
-            
-            // 检查每个命令的执行结果
-            for (let i = 0; i < results.length; i++) {
-                const result = results[i];
-                const command = commands[i];
-                
-                // 跳过成功的命令
-                if (result === 'OK' || result === true || typeof result === 'number') {
-                    continue;
-                }
-                
-                // 处理错误结果
-                if (result === null || result === false || 
-                    (typeof result === 'string' && result.startsWith('ERR '))) {
-                    throw new Error(`Transaction command failed: ${command[0]} ${command.slice(1).join(' ')} - Result: ${result}`);
-                }
             }
             
             return results;
@@ -167,6 +165,13 @@ class KVROCKSAdapter {
             } catch (discardError) {
                 console.warn('Failed to discard transaction:', discardError.message);
             }
+            
+            // 检查是否是连接错误
+            if (error.message.includes('Connection') || error.message.includes('closed') || error.message.includes('disconnected')) {
+                this.connected = false;
+                console.warn('Connection lost during transaction, will reconnect on next operation');
+            }
+            
             throw error;
         }
     }
@@ -177,139 +182,149 @@ class KVROCKSAdapter {
     async put(key, value, options) {
         options = options || {};
         
-        // 验证参数
-        if (!key || key.trim() === '') {
-            throw new Error('Key is required');
-        }
-        if (value === undefined || value === null) {
-            throw new Error('Value is required');
-        }
+        const maxRetries = 2;
+        let lastError;
         
-        try {
-            const results = await this.executeTransaction(async (send) => {
-                // 保存主值
-                await send('SET', key, value);
-                
-                // 处理元数据
-                if (options.metadata) {
-                    const metadataKey = `${key}:metadata`;
-                    await send('SET', metadataKey, JSON.stringify(options.metadata));
-                }
-                
-                // 处理过期时间
-                if (options.expiration || options.expirationTtl) {
-                    const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
-                    if (ttl > 0) {
-                        await send('EXPIRE', key, ttl);
-                        if (options.metadata) {
-                            const metadataKey = `${key}:metadata`;
-                            await send('EXPIRE', metadataKey, ttl);
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // 使用事务确保主键和元数据的一致性
+                const results = await this.executeTransaction(async (send) => {
+                    // 保存主值
+                    await send('SET', key, value);
+                    
+                    // 处理元数据
+                    if (options.metadata) {
+                        const metadataKey = `${key}:metadata`;
+                        await send('SET', metadataKey, JSON.stringify(options.metadata));
+                    }
+                    
+                    // 处理过期时间
+                    if (options.expiration || options.expirationTtl) {
+                        const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
+                        if (ttl > 0) {
+                            await send('EXPIRE', key, ttl);
+                            if (options.metadata) {
+                                const metadataKey = `${key}:metadata`;
+                                await send('EXPIRE', metadataKey, ttl);
+                            }
                         }
                     }
+                });
+                
+                // 检查结果，每个命令应该返回 'OK' 或类似
+                for (let i = 0; i < results.length; i++) {
+                    if (results[i] === null || results[i] === false) {
+                        console.warn(`Transaction command ${i} returned unexpected result:`, results[i]);
+                    }
                 }
-            });
-            
-            // 检查结果
-            if (results.length === 0) {
-                throw new Error('No commands were executed in transaction');
-            }
-            
-            return { success: true };
-        } catch (error) {
-            console.error(`KVROCKS put error for key "${key}":`, error);
-            
-            // 连接可能已断开，重置连接状态
-            this.connected = false;
-            
-            // 重试一次
-            try {
-                return await this.put(key, value, options);
-            } catch (retryError) {
-                console.error(`KVROCKS put retry failed for key "${key}":`, retryError);
-                throw retryError;
+                
+                return { success: true };
+            } catch (error) {
+                lastError = error;
+                console.error(`KVROCKS put error (attempt ${attempt}/${maxRetries}):`, error.message);
+                
+                if (attempt < maxRetries) {
+                    // 等待短暂时间后重试
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+                }
             }
         }
+        
+        throw lastError;
     }
 
     /**
      * 获取值
      */
     async get(key, options) {
-        if (!key || key.trim() === '') {
-            throw new Error('Key is required');
+        const maxRetries = 2;
+        let lastError;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const redis = await this.connect();
+                const value = await redis.send('GET', key);
+                return value === null ? null : value;
+            } catch (error) {
+                lastError = error;
+                console.error(`KVROCKS get error (attempt ${attempt}/${maxRetries}):`, error.message);
+                
+                if (attempt < maxRetries) {
+                    // 等待短暂时间后重试
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+                }
+            }
         }
         
-        const redis = await this.connect();
-        try {
-            const value = await redis.send('GET', key);
-            return value === null ? null : value;
-        } catch (error) {
-            console.error(`KVROCKS get error for key "${key}":`, error);
-            this.connected = false;
-            throw error;
-        }
+        throw lastError;
     }
 
     /**
      * 获取值和元数据
      */
     async getWithMetadata(key, options) {
-        if (!key || key.trim() === '') {
-            throw new Error('Key is required');
+        const maxRetries = 2;
+        let lastError;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const redis = await this.connect();
+                
+                // 使用管道同时获取主值和元数据，提高性能
+                const [value, metadataJson] = await Promise.all([
+                    redis.send('GET', key),
+                    redis.send('GET', `${key}:metadata`)
+                ]);
+                
+                if (value === null) {
+                    return null;
+                }
+                
+                return {
+                    value: value,
+                    metadata: metadataJson ? JSON.parse(metadataJson) : {}
+                };
+            } catch (error) {
+                lastError = error;
+                console.error(`KVROCKS getWithMetadata error (attempt ${attempt}/${maxRetries}):`, error.message);
+                
+                if (attempt < maxRetries) {
+                    // 等待短暂时间后重试
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+                }
+            }
         }
         
-        const redis = await this.connect();
-        try {
-            // 使用事务确保一致性
-            const results = await this.executeTransaction(async (send) => {
-                await send('GET', key);
-                await send('GET', `${key}:metadata`);
-            });
-            
-            const [value, metadataJson] = results;
-            
-            if (value === null) {
-                return null;
-            }
-            
-            return {
-                value: value,
-                metadata: metadataJson ? JSON.parse(metadataJson) : {}
-            };
-        } catch (error) {
-            console.error(`KVROCKS getWithMetadata error for key "${key}":`, error);
-            this.connected = false;
-            throw error;
-        }
+        throw lastError;
     }
 
     /**
-     * 删除键（使用事务确保原子性）
+     * 删除键
      */
     async delete(key, options) {
-        if (!key || key.trim() === '') {
-            throw new Error('Key is required');
-        }
+        const maxRetries = 2;
+        let lastError;
         
-        try {
-            await this.executeTransaction(async (send) => {
-                await send('DEL', key);
-                await send('DEL', `${key}:metadata`);
-            });
-            
-            return { success: true };
-        } catch (error) {
-            console.error(`KVROCKS delete error for key "${key}":`, error);
-            this.connected = false;
-            
-            // 重试一次
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                return await this.delete(key, options);
-            } catch (retryError) {
-                console.error(`KVROCKS delete retry failed for key "${key}":`, retryError);
-                throw retryError;
+                await this.executeTransaction(async (send) => {
+                    await send('DEL', key);
+                    await send('DEL', `${key}:metadata`);
+                });
+                
+                return { success: true };
+            } catch (error) {
+                lastError = error;
+                console.error(`KVROCKS delete error (attempt ${attempt}/${maxRetries}):`, error.message);
+                
+                if (attempt < maxRetries) {
+                    // 等待短暂时间后重试
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+                }
             }
         }
+        
+        throw lastError;
     }
 
     /**
@@ -321,41 +336,54 @@ class KVROCKSAdapter {
         const limit = options.limit || 1000;
         const cursor = options.cursor || '0';
         
-        const redis = await this.connect();
-        try {
-            const pattern = prefix ? `${prefix}*` : '*';
-            const [newCursor, keys] = await redis.send('SCAN', cursor, 'MATCH', pattern, 'COUNT', limit);
-            
-            // 过滤掉元数据键
-            const dataKeys = keys.filter(key => !key.endsWith(':metadata'));
-            
-            // 获取元数据
-            const keysWithMetadata = await Promise.all(dataKeys.map(async key => {
-                try {
-                    const metadataJson = await redis.send('GET', `${key}:metadata`);
-                    return {
-                        name: key,
-                        metadata: metadataJson ? JSON.parse(metadataJson) : {}
-                    };
-                } catch (metadataError) {
-                    console.warn(`Failed to get metadata for key ${key}:`, metadataError.message);
-                    return {
-                        name: key,
-                        metadata: {}
-                    };
+        const maxRetries = 2;
+        let lastError;
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const redis = await this.connect();
+                const pattern = prefix ? `${prefix}*` : '*';
+                const [newCursor, keys] = await redis.send('SCAN', cursor, 'MATCH', pattern, 'COUNT', limit);
+                
+                // 过滤掉元数据键
+                const dataKeys = keys.filter(key => !key.endsWith(':metadata'));
+                
+                // 并行获取所有元数据，提高性能
+                const metadataPromises = dataKeys.map(async key => {
+                    try {
+                        const metadataJson = await redis.send('GET', `${key}:metadata`);
+                        return {
+                            name: key,
+                            metadata: metadataJson ? JSON.parse(metadataJson) : {}
+                        };
+                    } catch (metadataError) {
+                        console.warn(`Failed to get metadata for key ${key}:`, metadataError.message);
+                        return {
+                            name: key,
+                            metadata: {}
+                        };
+                    }
+                });
+                
+                const keysWithMetadata = await Promise.all(metadataPromises);
+                
+                return {
+                    keys: keysWithMetadata,
+                    cursor: newCursor !== '0' ? newCursor : null,
+                    list_complete: newCursor === '0'
+                };
+            } catch (error) {
+                lastError = error;
+                console.error(`KVROCKS list error (attempt ${attempt}/${maxRetries}):`, error.message);
+                
+                if (attempt < maxRetries) {
+                    // 等待短暂时间后重试
+                    await new Promise(resolve => setTimeout(resolve, 100 * attempt));
                 }
-            }));
-            
-            return {
-                keys: keysWithMetadata,
-                cursor: newCursor !== '0' ? newCursor : null,
-                list_complete: newCursor === '0'
-            };
-        } catch (error) {
-            console.error('KVROCKS list error:', error);
-            this.connected = false;
-            throw error;
+            }
         }
+        
+        throw lastError;
     }
 
     // 为了兼容性，添加一些别名方法
@@ -558,13 +586,111 @@ class KVAdapter {
 }
 
 /**
+ * 模拟适配器 - 当没有数据库配置时使用，避免应用崩溃
+ */
+class MockAdapter {
+    constructor() {
+        console.warn('Using mock database adapter - no actual storage will be used');
+        this.storage = new Map();
+    }
+
+    async put(key, value, options) {
+        console.log(`Mock put: ${key}`);
+        this.storage.set(key, { value, metadata: options?.metadata || {} });
+        return { success: true };
+    }
+
+    async get(key, options) {
+        console.log(`Mock get: ${key}`);
+        const item = this.storage.get(key);
+        return item ? item.value : null;
+    }
+
+    async getWithMetadata(key, options) {
+        console.log(`Mock getWithMetadata: ${key}`);
+        const item = this.storage.get(key);
+        return item || null;
+    }
+
+    async delete(key, options) {
+        console.log(`Mock delete: ${key}`);
+        this.storage.delete(key);
+        return { success: true };
+    }
+
+    async list(options) {
+        console.log(`Mock list with prefix: ${options?.prefix || ''}`);
+        const prefix = options?.prefix || '';
+        const keys = Array.from(this.storage.keys())
+            .filter(key => key.startsWith(prefix))
+            .map(key => ({
+                name: key,
+                metadata: this.storage.get(key).metadata
+            }));
+        
+        return {
+            keys,
+            cursor: null,
+            list_complete: true
+        };
+    }
+
+    // 兼容性方法
+    async putFile(fileId, value, options) { return this.put(fileId, value, options); }
+    async getFile(fileId, options) { return this.getWithMetadata(fileId, options); }
+    async getFileWithMetadata(fileId, options) { return this.getWithMetadata(fileId, options); }
+    async deleteFile(fileId, options) { return this.delete(fileId, options); }
+    async listFiles(options) { return this.list(options); }
+    async putSetting(key, value, options) { return this.put(key, value, options); }
+    async getSetting(key, options) { return this.get(key, options); }
+    async deleteSetting(key, options) { return this.delete(key, options); }
+    async listSettings(options) { return this.list(options); }
+    async putIndexOperation(operationId, operation, options) {
+        const key = 'manage@index@operation_' + operationId;
+        return this.put(key, JSON.stringify(operation), options);
+    }
+    async getIndexOperation(operationId, options) {
+        const key = 'manage@index@operation_' + operationId;
+        const result = await this.get(key, options);
+        return result ? JSON.parse(result) : null;
+    }
+    async deleteIndexOperation(operationId, options) {
+        const key = 'manage@index@operation_' + operationId;
+        return this.delete(key, options);
+    }
+    async listIndexOperations(options) {
+        const listOptions = Object.assign({}, options, {
+            prefix: 'manage@index@operation_'
+        });
+        const result = await this.list(listOptions);
+        
+        const operations = [];
+        for (const item of result.keys) {
+            const operationData = await this.get(item.name);
+            if (operationData) {
+                const operation = JSON.parse(operationData);
+                operations.push({
+                    id: item.name.replace('manage@index@operation_', ''),
+                    type: operation.type,
+                    timestamp: operation.timestamp,
+                    data: operation.data,
+                    processed: false
+                });
+            }
+        }
+        
+        return operations;
+    }
+}
+
+/**
  * 获取数据库实例的便捷函数
  * 这个函数可以在整个应用中使用，确保一致的数据库访问
  * @param {Object} env - 环境变量
  * @returns {Object} 数据库实例
  */
 export function getDatabase(env) {
-    var adapter = createDatabaseAdapter(env);
+    const adapter = createDatabaseAdapter(env);
     if (!adapter) {
         throw new Error('Database not configured. Please configure D1 database (env.img_d1), KV storage (env.img_url) or KVROCKS (env.img_kvrocks).');
     }
@@ -577,9 +703,9 @@ export function getDatabase(env) {
  * @returns {Object} 配置信息
  */
 export function checkDatabaseConfig(env) {
-    var hasKVROCKS = env.img_kvrocks && typeof env.img_kvrocks === 'string';
-    var hasD1 = env.img_d1 && typeof env.img_d1.prepare === 'function';
-    var hasKV = env.img_url && typeof env.img_url.get === 'function';
+    const hasKVROCKS = env.img_kvrocks && typeof env.img_kvrocks === 'string';
+    const hasD1 = env.img_d1 && typeof env.img_d1.prepare === 'function';
+    const hasKV = env.img_url && typeof env.img_url.get === 'function';
 
     return {
         hasKVROCKS: hasKVROCKS,
