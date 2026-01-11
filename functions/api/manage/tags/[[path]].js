@@ -360,11 +360,11 @@ async function updateFileTags({
             break;
             
         case 'add':
-            updatedTags = mergeTags(existingTags, tags, 'add', options);
+            updatedTags = mergeTags(existingTags, tags, 'add');
             break;
             
         case 'remove':
-            updatedTags = mergeTags(existingTags, tags, 'remove', options);
+            updatedTags = mergeTags(existingTags, tags, 'remove');
             break;
             
         case 'replace':
@@ -497,30 +497,20 @@ async function handlePostTags(context, db, fileId, hostname) {
             });
         }
         
-        // Parse request body with size limit
-        const body = await new Promise((resolve, reject) => {
-            const chunks = [];
-            let size = 0;
-            const MAX_SIZE = 1024 * 100; // 100KB
-            
-            request.body.on('data', (chunk) => {
-                size += chunk.length;
-                if (size > MAX_SIZE) {
-                    reject(new Error('Request body too large'));
-                }
-                chunks.push(chunk);
+        // Parse request body with error handling
+        let body;
+        try {
+            body = await request.json();
+        } catch (error) {
+            return new Response(JSON.stringify({
+                error: 'Invalid JSON',
+                message: 'Request body contains invalid JSON',
+                details: error.message
+            }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
             });
-            
-            request.body.on('end', () => {
-                try {
-                    resolve(JSON.parse(Buffer.concat(chunks).toString()));
-                } catch (error) {
-                    reject(new Error('Invalid JSON'));
-                }
-            });
-            
-            request.body.on('error', reject);
-        });
+        }
         
         // Validate request
         const validation = validateTagRequest(body);
