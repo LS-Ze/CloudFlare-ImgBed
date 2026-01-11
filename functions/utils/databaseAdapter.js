@@ -51,6 +51,9 @@ class KVROCKSAdapter {
             isAlive: false,
             cacheDuration: 1000 // 缓存1秒
         };
+        
+        // 事务状态
+        this.inTransaction = false;
     }
 
     /**
@@ -86,7 +89,7 @@ class KVROCKSAdapter {
                     this.connectionCache = {
                         lastCheck: now,
                         isAlive: true,
-                        cacheDuration: this.cacheDuration
+                        cacheDuration: this.connectionCache.cacheDuration
                     };
                     
                     if (this.debugMode) console.log('Existing connection is alive');
@@ -114,12 +117,13 @@ class KVROCKSAdapter {
                     await this.redis.send('PING');
                     this.connected = true;
                     this.lastPingTime = now;
+                    this.inTransaction = false; // 重置事务状态
                     
                     // 更新连接缓存
                     this.connectionCache = {
                         lastCheck: now,
                         isAlive: true,
-                        cacheDuration: this.cacheDuration
+                        cacheDuration: this.connectionCache.cacheDuration
                     };
                     
                     console.log('Connected to KVROCKS successfully');
@@ -152,6 +156,12 @@ class KVROCKSAdapter {
         
         if (this.connected && this.redis) {
             try {
+                // 如果在事务中，先回滚
+                if (this.inTransaction) {
+                    await this.redis.send('DISCARD');
+                    this.inTransaction = false;
+                }
+                
                 await this.redis.close();
                 this.connected = false;
                 this.connectionCache.isAlive = false;
@@ -169,13 +179,52 @@ class KVROCKSAdapter {
         const redis = await this.connect();
         try {
             if (this.debugMode) console.log(`Executing command: ${command} ${args.join(' ')}`);
+            
+            // 跟踪事务状态
+            if (command.toUpperCase() === 'MULTI') {
+                this.inTransaction = true;
+            } else if (command.toUpperCase() === 'EXEC' || command.toUpperCase() === 'DISCARD') {
+                this.inTransaction = false;
+            }
+            
             return await redis.send(command, ...args);
         } catch (error) {
             console.error(`Command execution error: ${command} ${args.join(' ')}`, error);
             this.connected = false;
             this.connectionCache.isAlive = false;
+            this.inTransaction = false; // 重置事务状态
             throw error;
         }
+    }
+
+    /**
+     * 开始事务
+     */
+    async _beginTransaction() {
+        if (this.inTransaction) {
+            throw new Error('Already in a transaction');
+        }
+        await this._executeCommand('MULTI');
+    }
+
+    /**
+     * 提交事务
+     */
+    async _commitTransaction() {
+        if (!this.inTransaction) {
+            throw new Error('Not in a transaction');
+        }
+        return await this._executeCommand('EXEC');
+    }
+
+    /**
+     * 回滚事务
+     */
+    async _rollbackTransaction() {
+        if (!this.inTransaction) {
+            throw new Error('Not in a transaction');
+        }
+        return await this._executeCommand('DISCARD');
     }
 
     /**
@@ -198,54 +247,41 @@ class KVROCKSAdapter {
             throw error;
         }
         
-        const redis = await this.connect();
-        
         try {
             // 开始事务
-            if (this.debugMode) console.log('Starting transaction for put operation');
-            await redis.send('MULTI');
+            await this._beginTransaction();
             
             // 保存主值
-            if (this.debugMode) console.log(`Queuing SET command for key "${key}"`);
-            await redis.send('SET', key, value);
+            await this._executeCommand('SET', key, value);
             
             // 处理元数据
             if (options.metadata) {
                 const metadataKey = `${key}:metadata`;
-                if (this.debugMode) console.log(`Queuing SET command for metadata key "${metadataKey}"`);
-                await redis.send('SET', metadataKey, JSON.stringify(options.metadata));
+                await this._executeCommand('SET', metadataKey, JSON.stringify(options.metadata));
             }
             
             // 处理过期时间
             if (options.expiration || options.expirationTtl) {
                 const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
                 if (ttl > 0) {
-                    if (this.debugMode) console.log(`Queuing EXPIRE command for key "${key}" with TTL ${ttl}`);
-                    await redis.send('EXPIRE', key, ttl);
+                    await this._executeCommand('EXPIRE', key, ttl);
                     if (options.metadata) {
                         const metadataKey = `${key}:metadata`;
-                        if (this.debugMode) console.log(`Queuing EXPIRE command for metadata key "${metadataKey}" with TTL ${ttl}`);
-                        await redis.send('EXPIRE', metadataKey, ttl);
+                        await this._executeCommand('EXPIRE', metadataKey, ttl);
                     }
                 }
             }
             
-            // 执行事务
-            if (this.debugMode) console.log('Executing transaction');
-            const results = await redis.send('EXEC');
-            
-            // 检查事务是否被中止
-            if (results === null) {
-                const error = new Error('Transaction aborted - watched key was modified');
-                console.error(error.message);
-                throw error;
-            }
+            // 提交事务
+            const results = await this._commitTransaction();
             
             // 检查结果
+            if (results === null) {
+                throw new Error('Transaction aborted - watched key was modified');
+            }
+            
             if (results.length === 0) {
-                const error = new Error('No commands were executed in transaction');
-                console.error(error.message);
-                throw error;
+                throw new Error('No commands were executed in transaction');
             }
             
             // 检查每个命令的执行结果
@@ -253,9 +289,7 @@ class KVROCKSAdapter {
                 const result = results[i];
                 if (result === null || result === false || 
                     (typeof result === 'string' && result.startsWith('ERR '))) {
-                    const error = new Error(`Transaction command failed at index ${i}: ${result}`);
-                    console.error(error.message);
-                    throw error;
+                    throw new Error(`Transaction command failed at index ${i}: ${result}`);
                 }
             }
             
@@ -264,10 +298,11 @@ class KVROCKSAdapter {
         } catch (error) {
             // 尝试回滚事务
             try {
-                if (this.debugMode) console.log('Error occurred, attempting to discard transaction');
-                await redis.send('DISCARD');
-            } catch (discardError) {
-                console.warn('Failed to discard transaction:', discardError.message);
+                if (this.inTransaction) {
+                    await this._rollbackTransaction();
+                }
+            } catch (rollbackError) {
+                console.warn('Failed to rollback transaction:', rollbackError.message);
             }
             
             console.error(`KVROCKS put error for key "${key}":`, error);
@@ -275,6 +310,7 @@ class KVROCKSAdapter {
             // 连接可能已断开，重置连接状态
             this.connected = false;
             this.connectionCache.isAlive = false;
+            this.inTransaction = false;
             
             // 重试一次（防止无限递归）
             if (this.reconnectAttempts < 1) {
@@ -319,27 +355,20 @@ class KVROCKSAdapter {
             throw error;
         }
         
-        const redis = await this.connect();
-        
         try {
             // 开始事务
-            if (this.debugMode) console.log('Starting transaction for getWithMetadata operation');
-            await redis.send('MULTI');
+            await this._beginTransaction();
             
             // 获取主值和元数据
-            if (this.debugMode) console.log(`Queuing GET commands for key "${key}" and metadata`);
-            await redis.send('GET', key);
-            await redis.send('GET', `${key}:metadata`);
+            await this._executeCommand('GET', key);
+            await this._executeCommand('GET', `${key}:metadata`);
             
-            // 执行事务
-            if (this.debugMode) console.log('Executing transaction');
-            const results = await redis.send('EXEC');
+            // 提交事务
+            const results = await this._commitTransaction();
             
-            // 检查事务是否被中止
+            // 检查结果
             if (results === null) {
-                const error = new Error('Transaction aborted - watched key was modified');
-                console.error(error.message);
-                throw error;
+                throw new Error('Transaction aborted - watched key was modified');
             }
             
             const [value, metadataJson] = results;
@@ -359,15 +388,17 @@ class KVROCKSAdapter {
         } catch (error) {
             // 尝试回滚事务
             try {
-                if (this.debugMode) console.log('Error occurred, attempting to discard transaction');
-                await redis.send('DISCARD');
-            } catch (discardError) {
-                console.warn('Failed to discard transaction:', discardError.message);
+                if (this.inTransaction) {
+                    await this._rollbackTransaction();
+                }
+            } catch (rollbackError) {
+                console.warn('Failed to rollback transaction:', rollbackError.message);
             }
             
             console.error(`KVROCKS getWithMetadata error for key "${key}":`, error);
             this.connected = false;
             this.connectionCache.isAlive = false;
+            this.inTransaction = false;
             throw error;
         }
     }
@@ -384,27 +415,20 @@ class KVROCKSAdapter {
             throw error;
         }
         
-        const redis = await this.connect();
-        
         try {
             // 开始事务
-            if (this.debugMode) console.log('Starting transaction for delete operation');
-            await redis.send('MULTI');
+            await this._beginTransaction();
             
             // 删除主值和元数据
-            if (this.debugMode) console.log(`Queuing DEL commands for key "${key}" and metadata`);
-            await redis.send('DEL', key);
-            await redis.send('DEL', `${key}:metadata`);
+            await this._executeCommand('DEL', key);
+            await this._executeCommand('DEL', `${key}:metadata`);
             
-            // 执行事务
-            if (this.debugMode) console.log('Executing transaction');
-            const results = await redis.send('EXEC');
+            // 提交事务
+            const results = await this._commitTransaction();
             
-            // 检查事务是否被中止
+            // 检查结果
             if (results === null) {
-                const error = new Error('Transaction aborted - watched key was modified');
-                console.error(error.message);
-                throw error;
+                throw new Error('Transaction aborted - watched key was modified');
             }
             
             if (this.debugMode) console.log(`Successfully deleted key "${key}" in transaction`);
@@ -412,15 +436,17 @@ class KVROCKSAdapter {
         } catch (error) {
             // 尝试回滚事务
             try {
-                if (this.debugMode) console.log('Error occurred, attempting to discard transaction');
-                await redis.send('DISCARD');
-            } catch (discardError) {
-                console.warn('Failed to discard transaction:', discardError.message);
+                if (this.inTransaction) {
+                    await this._rollbackTransaction();
+                }
+            } catch (rollbackError) {
+                console.warn('Failed to rollback transaction:', rollbackError.message);
             }
             
             console.error(`KVROCKS delete error for key "${key}":`, error);
             this.connected = false;
             this.connectionCache.isAlive = false;
+            this.inTransaction = false;
             
             // 重试一次（防止无限递归）
             if (this.reconnectAttempts < 1) {
