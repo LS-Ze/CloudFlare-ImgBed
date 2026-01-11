@@ -19,9 +19,9 @@
     "ci-test": "concurrently --kill-others \"npm start\" \"wait-on http://localhost:8080 && mocha\"",
     "test": "mocha",
     "start": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data",
-    "start:kvrocks": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data --var img_kvrocks=redis://your_username:your_password@tcp.ap-northeast-1.clawcloudrun.com:44837",
+    "start:kvrocks": "npx wrangler pages dev ./ --kv \"img_url\" --r2 \"img_r2\" --ip 0.0.0.0 --port 8080 --persist-to ./data --var img_kvrocks=$REDIS_URL",
     "deploy": "npx wrangler pages deploy",
-    "deploy:kvrocks": "npx wrangler pages deploy --var img_kvrocks=redis://your_username:your_password@tcp.ap-northeast-1.clawcloudrun.com:44837",
+    "deploy:kvrocks": "npx wrangler pages deploy --var img_kvrocks=$REDIS_URL",
     "build": "echo \"Build completed successfully\""
   },
   "engines": {
