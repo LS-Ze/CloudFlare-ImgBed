@@ -54,6 +54,7 @@ class KVROCKSAdapter {
         
         // 事务状态
         this.inTransaction = false;
+        this.commandsExecuted = 0; // 跟踪事务中执行的命令数量
     }
 
     /**
@@ -118,6 +119,7 @@ class KVROCKSAdapter {
                     this.connected = true;
                     this.lastPingTime = now;
                     this.inTransaction = false; // 重置事务状态
+                    this.commandsExecuted = 0; // 重置命令计数器
                     
                     // 更新连接缓存
                     this.connectionCache = {
@@ -160,6 +162,7 @@ class KVROCKSAdapter {
                 if (this.inTransaction) {
                     await this.redis.send('DISCARD');
                     this.inTransaction = false;
+                    this.commandsExecuted = 0;
                 }
                 
                 await this.redis.close();
@@ -185,11 +188,17 @@ class KVROCKSAdapter {
                 throw new Error('PING command is not allowed in transactions');
             }
             
-            // 跟踪事务状态
+            // 跟踪事务状态和命令计数
             if (command.toUpperCase() === 'MULTI') {
                 this.inTransaction = true;
+                this.commandsExecuted = 0;
+            } else if (this.inTransaction && 
+                      command.toUpperCase() !== 'EXEC' && 
+                      command.toUpperCase() !== 'DISCARD') {
+                this.commandsExecuted++;
             } else if (command.toUpperCase() === 'EXEC' || command.toUpperCase() === 'DISCARD') {
                 this.inTransaction = false;
+                this.commandsExecuted = 0;
             }
             
             return await redis.send(command, ...args);
@@ -197,7 +206,8 @@ class KVROCKSAdapter {
             console.error(`Command execution error: ${command} ${args.join(' ')}`, error);
             this.connected = false;
             this.connectionCache.isAlive = false;
-            this.inTransaction = false; // 重置事务状态
+            this.inTransaction = false;
+            this.commandsExecuted = 0;
             throw error;
         }
     }
@@ -219,6 +229,14 @@ class KVROCKSAdapter {
         if (!this.inTransaction) {
             throw new Error('Not in a transaction');
         }
+        
+        // 检查是否有命令被执行
+        if (this.commandsExecuted === 0) {
+            // 没有命令被执行，自动回滚
+            await this._rollbackTransaction();
+            throw new Error('No commands were executed in transaction');
+        }
+        
         return await this._executeCommand('EXEC');
     }
 
@@ -229,7 +247,9 @@ class KVROCKSAdapter {
         if (!this.inTransaction) {
             throw new Error('Not in a transaction');
         }
-        return await this._executeCommand('DISCARD');
+        const result = await this._executeCommand('DISCARD');
+        this.commandsExecuted = 0;
+        return result;
     }
 
     /**
@@ -285,10 +305,6 @@ class KVROCKSAdapter {
                 throw new Error('Transaction aborted - watched key was modified');
             }
             
-            if (results.length === 0) {
-                throw new Error('No commands were executed in transaction');
-            }
-            
             // 检查每个命令的执行结果
             for (let i = 0; i < results.length; i++) {
                 const result = results[i];
@@ -316,6 +332,7 @@ class KVROCKSAdapter {
             this.connected = false;
             this.connectionCache.isAlive = false;
             this.inTransaction = false;
+            this.commandsExecuted = 0;
             
             // 重试一次（防止无限递归）
             if (this.reconnectAttempts < 1) {
@@ -404,6 +421,7 @@ class KVROCKSAdapter {
             this.connected = false;
             this.connectionCache.isAlive = false;
             this.inTransaction = false;
+            this.commandsExecuted = 0;
             throw error;
         }
     }
@@ -452,6 +470,7 @@ class KVROCKSAdapter {
             this.connected = false;
             this.connectionCache.isAlive = false;
             this.inTransaction = false;
+            this.commandsExecuted = 0;
             
             // 重试一次（防止无限递归）
             if (this.reconnectAttempts < 1) {
