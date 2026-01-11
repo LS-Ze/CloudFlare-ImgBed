@@ -1,11 +1,12 @@
 /**
- * Tag Management API with Path Handling Fixes
+ * Comprehensive Tag Management API Fix
  * 
- * This version fixes:
- * 1. File ID path handling (supports IDs with /img/ prefix)
- * 2. Authentication issues
- * 3. JSON response formatting
- * 4. CORS and error handling
+ * This version includes:
+ * 1. Authentication handling
+ * 2. Detailed error logging
+ * 3. Robust JSON response handling
+ * 4. Path configuration validation
+ * 5. Debug information
  */
 
 import { purgeCFCache } from "../../../utils/purgeCache.js";
@@ -14,14 +15,33 @@ import { getDatabase } from "../../../utils/databaseAdapter.js";
 import { mergeTags, normalizeTags, validateTag } from "../../../utils/tagHelpers.js";
 
 /**
+ * 全局配置
+ */
+const CONFIG = {
+    CACHE_TTL: 300,
+    MAX_TAG_LENGTH: 100,
+    MIN_TAG_LENGTH: 1,
+    SUPPORTED_ACTIONS: ['set', 'add', 'remove', 'replace', 'toggle', 'clear'],
+    ALLOWED_METHODS: ['GET', 'POST', 'DELETE', 'PATCH', 'OPTIONS'],
+    DEBUG_MODE: false, // Set to true for detailed logging
+    ALLOW_ANONYMOUS: false, // Set to true to allow anonymous access
+    ALLOWED_ORIGINS: ['https://hub.lsdns.top', 'https://curl.img.lsdns.top'] // Add your domains
+};
+
+/**
  * 安全的JSON字符串化函数
- * 确保始终返回有效的JSON
  */
 function safeStringify(obj) {
     try {
         return JSON.stringify(obj, (key, value) => {
             if (typeof value === 'bigint') return value.toString();
             if (value === undefined) return null;
+            if (value instanceof Error) {
+                return {
+                    message: value.message,
+                    stack: CONFIG.DEBUG_MODE ? value.stack : undefined
+                };
+            }
             return value;
         });
     } catch (error) {
@@ -29,21 +49,10 @@ function safeStringify(obj) {
         return JSON.stringify({
             error: 'Serialization error',
             message: 'Failed to serialize response',
-            details: error.message
+            details: CONFIG.DEBUG_MODE ? error.message : undefined
         });
     }
 }
-
-/**
- * 配置常量
- */
-const CONFIG = {
-    CACHE_TTL: 300,
-    MAX_TAG_LENGTH: 100,
-    MIN_TAG_LENGTH: 1,
-    SUPPORTED_ACTIONS: ['set', 'add', 'remove', 'replace', 'toggle', 'clear'],
-    ALLOWED_METHODS: ['GET', 'POST', 'DELETE', 'PATCH', 'OPTIONS']
-};
 
 /**
  * 缓存管理器
@@ -77,17 +86,108 @@ const CacheManager = {
 };
 
 /**
- * 处理CORS和预检请求
+ * 日志工具
+ */
+const Logger = {
+    log(...args) {
+        if (CONFIG.DEBUG_MODE) {
+            console.log('[Tag API]', ...args);
+        }
+    },
+    
+    error(...args) {
+        console.error('[Tag API ERROR]', ...args);
+    },
+    
+    warn(...args) {
+        console.warn('[Tag API WARN]', ...args);
+    }
+};
+
+/**
+ * 清理文件ID
+ */
+function cleanFileId(fileId) {
+    if (!fileId) return '';
+    
+    const cleaned = fileId
+        .replace(/^img\//i, '')
+        .replace(/^files\//i, '')
+        .replace(/^uploads\//i, '')
+        .replace(/^images\//i, '')
+        .replace(/^\//, '')
+        .replace(/\?.*/, ''); // Remove query parameters
+    
+    Logger.log(`File ID cleaned: "${fileId}" -> "${cleaned}"`);
+    return cleaned;
+}
+
+/**
+ * 验证文件ID
+ */
+function validateFileId(fileId) {
+    if (!fileId || typeof fileId !== 'string') {
+        return false;
+    }
+    
+    const fileIdRegex = /^[a-zA-Z0-9_\-\/\.]{8,128}$/;
+    return fileIdRegex.test(fileId);
+}
+
+/**
+ * 验证认证
+ */
+function validateAuth(request, env) {
+    if (CONFIG.ALLOW_ANONYMOUS) {
+        Logger.log('Anonymous access allowed');
+        return { valid: true };
+    }
+    
+    // Check API token
+    const authHeader = request.headers.get('Authorization');
+    if (authHeader) {
+        const token = authHeader.replace(/^Bearer\s+/i, '');
+        if (token && token === env.API_TOKEN) {
+            Logger.log('API token authentication successful');
+            return { valid: true };
+        }
+    }
+    
+    // Check cookie authentication
+    const cookieHeader = request.headers.get('Cookie');
+    if (cookieHeader && cookieHeader.includes('auth_token=')) {
+        const tokenMatch = cookieHeader.match(/auth_token=([^;]+)/);
+        if (tokenMatch && tokenMatch[1] === env.AUTH_TOKEN) {
+            Logger.log('Cookie authentication successful');
+            return { valid: true };
+        }
+    }
+    
+    Logger.error('Authentication failed');
+    return {
+        valid: false,
+        error: 'Unauthorized',
+        message: 'Authentication required'
+    };
+}
+
+/**
+ * 处理CORS
  */
 function handleCORS(request) {
+    const origin = request.headers.get('Origin') || '';
+    const allowedOrigin = CONFIG.ALLOWED_ORIGINS.includes(origin) ? origin : '*';
+    
     const headers = {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': allowedOrigin,
         'Access-Control-Allow-Methods': CONFIG.ALLOWED_METHODS.join(', '),
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Max-Age': '86400'
     };
 
     if (request.method === 'OPTIONS') {
+        Logger.log('Handling OPTIONS preflight request');
         return new Response(null, { 
             status: 204, 
             headers 
@@ -95,39 +195,6 @@ function handleCORS(request) {
     }
 
     return headers;
-}
-
-/**
- * 清理文件ID（移除路径前缀）
- * @param {string} fileId - 原始文件ID
- * @returns {string} 清理后的文件ID
- */
-function cleanFileId(fileId) {
-    if (!fileId) return '';
-    
-    // 移除常见的路径前缀
-    const cleaned = fileId
-        .replace(/^img\//i, '')       // 移除 img/ 前缀
-        .replace(/^files\//i, '')     // 移除 files/ 前缀
-        .replace(/^uploads\//i, '')   // 移除 uploads/ 前缀
-        .replace(/^images\//i, '')    // 移除 images/ 前缀
-        .replace(/^\//, '');          // 移除开头的斜杠
-    
-    console.log(`Cleaned file ID: "${fileId}" -> "${cleaned}"`);
-    return cleaned;
-}
-
-/**
- * 验证文件ID格式
- */
-function validateFileId(fileId) {
-    if (!fileId || typeof fileId !== 'string') {
-        return false;
-    }
-    
-    // 支持包含路径的文件ID格式
-    const fileIdRegex = /^[a-zA-Z0-9_\-\/\.]{8,128}$/;
-    return fileIdRegex.test(fileId);
 }
 
 /**
@@ -266,20 +333,22 @@ async function getFileTags(db, fileId, bypassCache = false) {
     if (!bypassCache) {
         const cached = CacheManager.get(cacheKey);
         if (cached) {
+            Logger.log(`Cache hit for ${cleanedId}`);
             return { ...cached, fromCache: true };
         }
     }
 
     try {
-        console.log(`Getting tags for file: ${cleanedId}`);
+        Logger.log(`Getting tags from database for ${cleanedId}`);
         const fileData = await db.getWithMetadata(cleanedId);
 
         if (!fileData) {
-            console.error(`File ${cleanedId} not found`);
+            Logger.error(`File ${cleanedId} not found in database`);
             throw new Error('File not found');
         }
 
         if (!fileData.metadata) {
+            Logger.warn(`File ${cleanedId} has no metadata, initializing empty`);
             fileData.metadata = {};
         }
 
@@ -296,7 +365,7 @@ async function getFileTags(db, fileId, bypassCache = false) {
         return result;
 
     } catch (error) {
-        console.error(`Error getting tags:`, error);
+        Logger.error(`Error getting tags:`, error);
         throw error;
     }
 }
@@ -309,15 +378,16 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
     const { waitUntil, env } = context;
 
     try {
-        console.log(`Updating tags for ${cleanedId}:`, { action, tags, options });
+        Logger.log(`Updating tags for ${cleanedId}:`, { action, tags, options });
         const fileData = await db.getWithMetadata(cleanedId);
 
         if (!fileData) {
-            console.error(`File ${cleanedId} not found`);
+            Logger.error(`File ${cleanedId} not found in database`);
             throw new Error('File not found');
         }
 
         if (!fileData.metadata) {
+            Logger.warn(`File ${cleanedId} has no metadata, creating new`);
             fileData.metadata = {};
         }
 
@@ -363,6 +433,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         const tagsChanged = JSON.stringify(existingTags.sort()) !== JSON.stringify(updatedTags.sort());
 
         if (!tagsChanged) {
+            Logger.log(`No tag changes for ${cleanedId}`);
             return {
                 fileId: cleanedId,
                 originalFileId: fileId,
@@ -383,6 +454,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         });
 
         CacheManager.clear(`tags:${cleanedId}`);
+        Logger.log(`Tags updated for ${cleanedId}:`, updatedTags);
 
         return {
             fileId: cleanedId,
@@ -396,7 +468,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         };
 
     } catch (error) {
-        console.error(`Error updating tags:`, error);
+        Logger.error(`Error updating tags:`, error);
         throw error;
     }
 }
@@ -415,12 +487,13 @@ async function handleGetTags(db, fileId) {
                 fileId: result.fileId,
                 originalFileId: result.originalFileId,
                 tags: result.tags,
-                fromCache: result.fromCache
+                fromCache: result.fromCache,
+                timestamp: Date.now()
             }
         };
 
     } catch (error) {
-        console.error(`GET error:`, error);
+        Logger.error(`GET error:`, error);
         
         if (error.message === 'File not found') {
             return {
@@ -428,7 +501,9 @@ async function handleGetTags(db, fileId) {
                 body: {
                     error: 'File not found',
                     fileId: cleanFileId(fileId),
-                    originalFileId: fileId
+                    originalFileId: fileId,
+                    message: 'The requested file was not found in the database',
+                    timestamp: Date.now()
                 }
             };
         }
@@ -438,7 +513,8 @@ async function handleGetTags(db, fileId) {
             body: {
                 error: 'Internal server error',
                 message: 'Failed to get tags',
-                details: error.message
+                details: CONFIG.DEBUG_MODE ? error.message : undefined,
+                timestamp: Date.now()
             }
         };
     }
@@ -453,12 +529,14 @@ async function handlePostTags(context, db, fileId, hostname) {
     try {
         const contentType = request.headers.get('Content-Type');
         if (!contentType || !contentType.includes('application/json')) {
+            Logger.error(`Unsupported content type: ${contentType}`);
             return {
                 status: 415,
                 body: {
                     error: 'Unsupported media type',
                     message: 'Request must be JSON',
-                    receivedType: contentType
+                    receivedType: contentType,
+                    timestamp: Date.now()
                 }
             };
         }
@@ -466,37 +544,40 @@ async function handlePostTags(context, db, fileId, hostname) {
         let body;
         try {
             const bodyText = await request.text();
-            console.log('Request body:', bodyText);
+            Logger.log('Request body text:', bodyText);
             
             if (!bodyText.trim()) {
                 throw new Error('Empty request body');
             }
             
             body = JSON.parse(bodyText);
-            console.log('Parsed body:', body);
+            Logger.log('Parsed request body:', body);
 
         } catch (error) {
-            console.error('JSON parse error:', error);
+            Logger.error('JSON parse error:', error);
             return {
                 status: 400,
                 body: {
                     error: 'Invalid JSON',
                     message: 'Request body contains invalid JSON',
-                    details: error.message
+                    details: CONFIG.DEBUG_MODE ? error.message : undefined,
+                    receivedBody: CONFIG.DEBUG_MODE ? await request.text().catch(() => 'Unable to read') : undefined,
+                    timestamp: Date.now()
                 }
             };
         }
 
         const validation = validateTagRequest(body);
         if (!validation.valid) {
-            console.error('Validation failed:', validation);
+            Logger.error('Request validation failed:', validation);
             return {
                 status: 400,
                 body: {
                     error: validation.error,
                     message: validation.message,
                     ...(validation.invalidTags && { invalidTags: validation.invalidTags }),
-                    ...(validation.duplicateTags && { duplicateTags: validation.duplicateTags })
+                    ...(validation.duplicateTags && { duplicateTags: validation.duplicateTags }),
+                    timestamp: Date.now()
                 }
             };
         }
@@ -514,11 +595,11 @@ async function handlePostTags(context, db, fileId, hostname) {
         if (result.changed) {
             const cdnUrl = `https://${hostname}/file/${result.fileId}`;
             waitUntil(purgeCFCache(context.env, cdnUrl).catch(err => 
-                console.error(`Cache purge error:`, err)
+                Logger.error(`Cache purge error:`, err)
             ));
 
             waitUntil(addFileToIndex(context, result.fileId, result.metadata).catch(err => 
-                console.error(`Index update error:`, err)
+                Logger.error(`Index update error:`, err)
             ));
         }
 
@@ -532,12 +613,13 @@ async function handlePostTags(context, db, fileId, hostname) {
                 tags: result.tags,
                 existingTags: result.existingTags,
                 updatedTags: result.updatedTags,
-                changed: result.changed
+                changed: result.changed,
+                timestamp: Date.now()
             }
         };
 
     } catch (error) {
-        console.error(`POST error:`, error);
+        Logger.error(`POST error:`, error);
         
         if (error.message === 'File not found') {
             return {
@@ -545,7 +627,9 @@ async function handlePostTags(context, db, fileId, hostname) {
                 body: {
                     error: 'File not found',
                     fileId: cleanFileId(fileId),
-                    originalFileId: fileId
+                    originalFileId: fileId,
+                    message: 'The requested file was not found in the database',
+                    timestamp: Date.now()
                 }
             };
         }
@@ -555,7 +639,8 @@ async function handlePostTags(context, db, fileId, hostname) {
             body: {
                 error: 'Internal server error',
                 message: 'Failed to update tags',
-                details: error.message
+                details: CONFIG.DEBUG_MODE ? error.message : undefined,
+                timestamp: Date.now()
             }
         };
     }
@@ -578,11 +663,11 @@ async function handleDeleteTags(context, db, fileId, hostname) {
         if (result.changed) {
             const cdnUrl = `https://${hostname}/file/${result.fileId}`;
             context.waitUntil(purgeCFCache(context.env, cdnUrl).catch(err => 
-                console.error(`Cache purge error:`, err)
+                Logger.error(`Cache purge error:`, err)
             ));
 
             context.waitUntil(addFileToIndex(context, result.fileId, result.metadata).catch(err => 
-                console.error(`Index update error:`, err)
+                Logger.error(`Index update error:`, err)
             ));
         }
 
@@ -595,12 +680,13 @@ async function handleDeleteTags(context, db, fileId, hostname) {
                 action: 'clear',
                 tags: result.tags,
                 existingTags: result.existingTags,
-                changed: result.changed
+                changed: result.changed,
+                timestamp: Date.now()
             }
         };
 
     } catch (error) {
-        console.error(`DELETE error:`, error);
+        Logger.error(`DELETE error:`, error);
         
         if (error.message === 'File not found') {
             return {
@@ -608,7 +694,9 @@ async function handleDeleteTags(context, db, fileId, hostname) {
                 body: {
                     error: 'File not found',
                     fileId: cleanFileId(fileId),
-                    originalFileId: fileId
+                    originalFileId: fileId,
+                    message: 'The requested file was not found in the database',
+                    timestamp: Date.now()
                 }
             };
         }
@@ -618,7 +706,8 @@ async function handleDeleteTags(context, db, fileId, hostname) {
             body: {
                 error: 'Internal server error',
                 message: 'Failed to clear tags',
-                details: error.message
+                details: CONFIG.DEBUG_MODE ? error.message : undefined,
+                timestamp: Date.now()
             }
         };
     }
@@ -632,34 +721,58 @@ export async function onRequest(context) {
     const { request, env, params } = context;
     const url = new URL(request.url);
 
-    console.log(`=== Tag API Request ===`);
-    console.log(`Method: ${request.method}`);
-    console.log(`URL: ${request.url}`);
-    console.log(`Params:`, params);
+    // Set debug mode from environment variable
+    CONFIG.DEBUG_MODE = env.DEBUG_MODE === 'true' || CONFIG.DEBUG_MODE;
+    
+    Logger.log(`=== New Request ===`);
+    Logger.log(`Method: ${request.method}`);
+    Logger.log(`URL: ${request.url}`);
+    Logger.log(`Hostname: ${url.hostname}`);
+    Logger.log(`Path: ${url.pathname}`);
+    Logger.log(`Params:`, params);
 
     try {
-        // 处理CORS
+        // Handle CORS first
         const corsHeaders = handleCORS(request);
         if (corsHeaders instanceof Response) {
             return corsHeaders;
         }
 
-        // 解析文件路径
+        // Validate authentication
+        const authResult = validateAuth(request, env);
+        if (!authResult.valid) {
+            return new Response(safeStringify({
+                error: authResult.error,
+                message: authResult.message,
+                timestamp: Date.now()
+            }), {
+                status: 401,
+                headers: {
+                    ...corsHeaders,
+                    'Content-Type': 'application/json',
+                    'WWW-Authenticate': 'Bearer'
+                }
+            });
+        }
+
+        // Parse file ID from params
         let fileId = '';
         if (params.path) {
             fileId = String(params.path).split(',').join('/');
         }
         fileId = decodeURIComponent(fileId || '');
 
-        console.log(`Original file ID: "${fileId}"`);
+        Logger.log(`Original file ID from request: "${fileId}"`);
 
-        // 验证文件ID
+        // Validate file ID format
         if (!validateFileId(fileId)) {
-            console.error(`Invalid file ID: "${fileId}"`);
+            Logger.error(`Invalid file ID format: "${fileId}"`);
             return new Response(safeStringify({
                 error: 'Invalid file ID',
                 message: 'File ID format is invalid',
-                fileId: fileId
+                fileId: fileId,
+                validFormat: 'Should contain only letters, numbers, slashes, dots, underscores, and hyphens',
+                timestamp: Date.now()
             }), {
                 status: 400,
                 headers: { 
@@ -669,9 +782,29 @@ export async function onRequest(context) {
             });
         }
 
-        const db = getDatabase(env);
-        let response;
+        // Check if database is available
+        let db;
+        try {
+            db = getDatabase(env);
+            Logger.log('Database connection established');
+        } catch (dbError) {
+            Logger.error('Database connection error:', dbError);
+            return new Response(safeStringify({
+                error: 'Database error',
+                message: 'Failed to connect to database',
+                details: CONFIG.DEBUG_MODE ? dbError.message : undefined,
+                timestamp: Date.now()
+            }), {
+                status: 503,
+                headers: { 
+                    ...corsHeaders,
+                    'Content-Type': 'application/json'
+                }
+            });
+        }
 
+        // Route request
+        let response;
         switch (request.method) {
             case 'GET':
                 response = await handleGetTags(db, fileId);
@@ -692,38 +825,44 @@ export async function onRequest(context) {
                     body: {
                         error: 'Method not allowed',
                         allowedMethods: CONFIG.ALLOWED_METHODS,
-                        receivedMethod: request.method
+                        receivedMethod: request.method,
+                        timestamp: Date.now()
                     }
                 };
         }
 
+        // Log response details
         const duration = performance.now() - startTime;
-        console.log(`=== Response (${duration.toFixed(2)}ms) ===`);
-        console.log(`Status: ${response.status}`);
-        console.log(`Body:`, response.body);
+        Logger.log(`=== Response (${duration.toFixed(2)}ms) ===`);
+        Logger.log(`Status: ${response.status}`);
+        Logger.log(`Body:`, response.body);
 
+        // Send response
         return new Response(safeStringify(response.body), {
             status: response.status,
             headers: {
                 ...corsHeaders,
                 'Content-Type': 'application/json',
                 'X-Processing-Time': `${duration.toFixed(2)}ms`,
+                'X-API-Version': '1.2.0',
                 'Cache-Control': response.status === 200 ? 'public, max-age=60' : 'no-store'
             }
         });
 
     } catch (error) {
         const duration = performance.now() - startTime;
-        console.error(`=== Fatal Error (${duration.toFixed(2)}ms) ===`);
-        console.error(`Error:`, error);
-        console.error(`Stack:`, error.stack);
+        Logger.error(`=== Fatal Error (${duration.toFixed(2)}ms) ===`);
+        Logger.error(`Error:`, error);
+        Logger.error(`Stack:`, error.stack);
 
+        // Send error response
         return new Response(safeStringify({
             error: 'Internal server error',
             message: 'An unexpected error occurred',
-            details: env.DEBUG_MODE === 'true' ? error.message : undefined,
-            stack: env.DEBUG_MODE === 'true' ? error.stack : undefined,
-            processingTime: `${duration.toFixed(2)}ms`
+            details: CONFIG.DEBUG_MODE ? error.message : undefined,
+            stack: CONFIG.DEBUG_MODE ? error.stack : undefined,
+            processingTime: `${duration.toFixed(2)}ms`,
+            timestamp: Date.now()
         }), {
             status: 500,
             headers: {
