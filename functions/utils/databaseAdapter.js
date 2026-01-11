@@ -180,6 +180,11 @@ class KVROCKSAdapter {
         try {
             if (this.debugMode) console.log(`Executing command: ${command} ${args.join(' ')}`);
             
+            // 检查是否在事务中执行PING
+            if (this.inTransaction && command.toUpperCase() === 'PING') {
+                throw new Error('PING command is not allowed in transactions');
+            }
+            
             // 跟踪事务状态
             if (command.toUpperCase() === 'MULTI') {
                 this.inTransaction = true;
