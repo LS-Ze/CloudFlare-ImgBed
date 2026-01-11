@@ -61,6 +61,7 @@ class KVROCKSAdapter {
         while (this.reconnectAttempts < this.maxReconnectAttempts) {
             try {
                 this.redis = createRedis(this.connectionString);
+                // 测试连接
                 await this.redis.send('PING');
                 this.connected = true;
                 this.reconnectAttempts = 0; // 重置重试计数器
@@ -97,39 +98,82 @@ class KVROCKSAdapter {
     }
 
     /**
+     * 执行Redis事务
+     * @param {Function} transaction - 事务函数，接收sendCommand方法
+     * @returns {Array} 事务结果
+     */
+    async executeTransaction(transaction) {
+        const redis = await this.connect();
+        
+        try {
+            // 开始事务
+            await redis.send('MULTI');
+            
+            // 执行事务命令
+            const commands = [];
+            const sendCommand = (...args) => {
+                commands.push(args);
+                return redis.send(...args);
+            };
+            
+            await transaction(sendCommand);
+            
+            // 执行事务
+            const results = await redis.send('EXEC');
+            
+            // 检查事务是否被中止
+            if (results === null) {
+                throw new Error('Transaction aborted - watched key was modified');
+            }
+            
+            return results;
+        } catch (error) {
+            // 尝试回滚事务
+            try {
+                await redis.send('DISCARD');
+            } catch (discardError) {
+                console.warn('Failed to discard transaction:', discardError.message);
+            }
+            throw error;
+        }
+    }
+
+    /**
      * 保存键值对（使用事务确保原子性）
      */
     async put(key, value, options) {
         options = options || {};
-        const redis = await this.connect();
         
         try {
-            // 使用MULTI确保操作原子性
-            const multi = redis.multi();
-            
-            // 保存主值
-            multi.send('SET', key, value);
-            
-            // 处理元数据
-            if (options.metadata) {
-                const metadataKey = `${key}:metadata`;
-                multi.send('SET', metadataKey, JSON.stringify(options.metadata));
-            }
-            
-            // 处理过期时间
-            if (options.expiration || options.expirationTtl) {
-                const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
-                if (ttl > 0) {
-                    multi.send('EXPIRE', key, ttl);
-                    if (options.metadata) {
-                        const metadataKey = `${key}:metadata`;
-                        multi.send('EXPIRE', metadataKey, ttl);
+            const results = await this.executeTransaction(async (send) => {
+                // 保存主值
+                await send('SET', key, value);
+                
+                // 处理元数据
+                if (options.metadata) {
+                    const metadataKey = `${key}:metadata`;
+                    await send('SET', metadataKey, JSON.stringify(options.metadata));
+                }
+                
+                // 处理过期时间
+                if (options.expiration || options.expirationTtl) {
+                    const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
+                    if (ttl > 0) {
+                        await send('EXPIRE', key, ttl);
+                        if (options.metadata) {
+                            const metadataKey = `${key}:metadata`;
+                            await send('EXPIRE', metadataKey, ttl);
+                        }
                     }
                 }
-            }
+            });
             
-            // 执行事务
-            await multi.exec();
+            // 检查结果
+            for (let i = 0; i < results.length; i++) {
+                if (results[i] === null || results[i] === false) {
+                    throw new Error(`Transaction command failed at index ${i}: ${results[i]}`);
+                }
+            }
             
             return { success: true };
         } catch (error) {
@@ -140,29 +184,7 @@ class KVROCKSAdapter {
             
             // 重试一次
             try {
-                const redis = await this.connect();
-                const multi = redis.multi();
-                
-                multi.send('SET', key, value);
-                
-                if (options.metadata) {
-                    const metadataKey = `${key}:metadata`;
-                    multi.send('SET', metadataKey, JSON.stringify(options.metadata));
-                }
-                
-                if (options.expiration || options.expirationTtl) {
-                    const ttl = options.expirationTtl || Math.max(0, Math.floor((options.expiration - Date.now()) / 1000));
-                    if (ttl > 0) {
-                        multi.send('EXPIRE', key, ttl);
-                        if (options.metadata) {
-                            const metadataKey = `${key}:metadata`;
-                            multi.send('EXPIRE', metadataKey, ttl);
-                        }
-                    }
-                }
-                
-                await multi.exec();
-                return { success: true };
+                return await this.put(key, value, options);
             } catch (retryError) {
                 console.error('KVROCKS put retry failed:', retryError);
                 throw retryError;
@@ -191,10 +213,13 @@ class KVROCKSAdapter {
     async getWithMetadata(key, options) {
         const redis = await this.connect();
         try {
-            const [value, metadataJson] = await Promise.all([
-                redis.send('GET', key),
-                redis.send('GET', `${key}:metadata`)
-            ]);
+            // 使用事务确保一致性
+            const results = await this.executeTransaction(async (send) => {
+                await send('GET', key);
+                await send('GET', `${key}:metadata`);
+            });
+            
+            const [value, metadataJson] = results;
             
             if (value === null) {
                 return null;
@@ -215,13 +240,11 @@ class KVROCKSAdapter {
      * 删除键（使用事务确保原子性）
      */
     async delete(key, options) {
-        const redis = await this.connect();
         try {
-            // 使用MULTI确保操作原子性
-            const multi = redis.multi();
-            multi.send('DEL', key);
-            multi.send('DEL', `${key}:metadata`);
-            await multi.exec();
+            await this.executeTransaction(async (send) => {
+                await send('DEL', key);
+                await send('DEL', `${key}:metadata`);
+            });
             
             return { success: true };
         } catch (error) {
@@ -230,12 +253,7 @@ class KVROCKSAdapter {
             
             // 重试一次
             try {
-                const redis = await this.connect();
-                const multi = redis.multi();
-                multi.send('DEL', key);
-                multi.send('DEL', `${key}:metadata`);
-                await multi.exec();
-                return { success: true };
+                return await this.delete(key, options);
             } catch (retryError) {
                 console.error('KVROCKS delete retry failed:', retryError);
                 throw retryError;
