@@ -1,12 +1,8 @@
 /**
- * Enhanced Tag Management API with Debug Features
+ * Universal Path Fix for Tag Management API
  * 
- * This version includes:
- * 1. Comprehensive error handling
- * 2. Detailed debug logging
- * 3. Robust JSON response handling
- * 4. Input validation improvements
- * 5. Better error messages
+ * This version focuses on path format: /file/img/KfONFGrt.webp
+ * Both domains are supported: hub.lsdns.top and curl.img.lsdns.top
  */
 
 import { purgeCFCache } from "../../../utils/purgeCache.js";
@@ -15,7 +11,7 @@ import { getDatabase } from "../../../utils/databaseAdapter.js";
 import { mergeTags, normalizeTags, validateTag } from "../../../utils/tagHelpers.js";
 
 /**
- * 全局配置
+ * 全局配置 - 支持双域名
  */
 const CONFIG = {
     CACHE_TTL: 300,
@@ -23,11 +19,19 @@ const CONFIG = {
     MIN_TAG_LENGTH: 1,
     SUPPORTED_ACTIONS: ['set', 'add', 'remove', 'replace', 'toggle', 'clear'],
     ALLOWED_METHODS: ['GET', 'POST', 'DELETE', 'PATCH', 'OPTIONS'],
-    DEBUG_MODE: true, // Force debug mode for troubleshooting
+    DEBUG_MODE: true, // 强制调试模式
     ALLOW_ANONYMOUS: false,
+    
+    // 支持双域名
+    SUPPORTED_DOMAINS: ['hub.lsdns.top', 'curl.img.lsdns.top'],
     ALLOWED_ORIGINS: ['https://hub.lsdns.top', 'https://curl.img.lsdns.top'],
-    MAX_REQUEST_SIZE: 1024 * 1024, // 1MB
-    REQUEST_TIMEOUT: 30000 // 30 seconds
+    
+    // 关键路径配置
+    FILE_PATH_PREFIX: 'file/',
+    FILE_PATH_REGEX: /^\/?file\/?/i,
+    
+    MAX_REQUEST_SIZE: 1024 * 1024,
+    REQUEST_TIMEOUT: 30000
 };
 
 /**
@@ -116,35 +120,77 @@ const Logger = {
 };
 
 /**
- * 清理文件ID
+ * 通用路径处理 - 确保格式为 /file/img/KfONFGrt.webp
  */
-function cleanFileId(fileId) {
-    if (!fileId) return '';
+function processFilePath(fileId) {
+    if (!fileId) return { 
+        cleanedPath: '', 
+        originalPath: '', 
+        fullPath: '',
+        fileId: '',
+        pathParts: []
+    };
     
-    const cleaned = fileId
-        .replace(/^img\//i, '')
-        .replace(/^files\//i, '')
-        .replace(/^uploads\//i, '')
-        .replace(/^images\//i, '')
-        .replace(/^\//, '')
-        .replace(/\?.*/, '')
-        .replace(/\/+/g, '/')
-        .trim();
+    // 解码URL编码的字符
+    const decodedId = decodeURIComponent(fileId);
+    Logger.debug(`Original input: "${fileId}" (decoded: "${decodedId}")`);
     
-    Logger.debug(`File ID cleaned: "${fileId}" -> "${cleaned}"`);
-    return cleaned;
+    // 标准化路径格式
+    let normalizedPath = decodedId
+        .replace(/\/+/g, '/')            // 合并多个斜杠
+        .replace(/^\//, '')              // 移除开头的斜杠
+        .replace(/\?.*/, '')             // 移除查询参数
+        .trim();                         // 去除首尾空格
+    
+    // 检查是否已经包含 file/ 前缀
+    const hasFilePrefix = CONFIG.FILE_PATH_REGEX.test(normalizedPath);
+    
+    // 确保路径以 file/ 开头
+    let fullPath = hasFilePrefix 
+        ? normalizedPath 
+        : `${CONFIG.FILE_PATH_PREFIX}${normalizedPath}`;
+    
+    // 分割路径部分
+    const pathParts = fullPath.split('/').filter(part => part.trim() !== '');
+    
+    // 提取文件ID（最后一部分）
+    const fileIdPart = pathParts.length > 0 ? pathParts[pathParts.length - 1] : '';
+    
+    // 清理后的路径（不包含 file/ 前缀）
+    const cleanedPath = hasFilePrefix 
+        ? normalizedPath.replace(CONFIG.FILE_PATH_REGEX, '') 
+        : normalizedPath;
+    
+    Logger.debug(`Path processing result:`);
+    Logger.debug(`  Original:     "${fileId}"`);
+    Logger.debug(`  Decoded:      "${decodedId}"`);
+    Logger.debug(`  Normalized:   "${normalizedPath}"`);
+    Logger.debug(`  Has file/:    ${hasFilePrefix}`);
+    Logger.debug(`  Full path:    "${fullPath}"`);
+    Logger.debug(`  Cleaned path: "${cleanedPath}"`);
+    Logger.debug(`  File ID:      "${fileIdPart}"`);
+    Logger.debug(`  Path parts:   ${JSON.stringify(pathParts)}`);
+    
+    return {
+        cleanedPath,
+        originalPath: fileId,
+        fullPath,
+        fileId: fileIdPart,
+        pathParts
+    };
 }
 
 /**
- * 验证文件ID
+ * 验证文件路径格式
  */
-function validateFileId(fileId) {
-    if (!fileId || typeof fileId !== 'string') {
+function validateFilePath(filePath) {
+    if (!filePath || typeof filePath !== 'string') {
         return false;
     }
     
-    const fileIdRegex = /^[a-zA-Z0-9_\-\/\.]{8,128}$/;
-    return fileIdRegex.test(fileId);
+    // 允许包含 file/ 前缀的路径
+    const pathRegex = /^[a-zA-Z0-9_\-\/\.%]{8,128}$/;
+    return pathRegex.test(filePath);
 }
 
 /**
@@ -348,39 +394,70 @@ function processTags(tags, options) {
 /**
  * 获取文件标签
  */
-async function getFileTags(db, fileId, bypassCache = false) {
-    const cleanedId = cleanFileId(fileId);
-    const cacheKey = `tags:${cleanedId}`;
+async function getFileTags(db, pathInfo, hostname) {
+    const { fullPath, cleanedPath, fileId } = pathInfo;
+    const cacheKey = `tags:${fullPath}`;
 
-    if (!bypassCache) {
-        const cached = CacheManager.get(cacheKey);
-        if (cached) {
-            Logger.debug(`Cache hit for ${cleanedId}`);
-            return { ...cached, fromCache: true };
-        }
+    // 检查缓存
+    const cached = CacheManager.get(cacheKey);
+    if (cached) {
+        Logger.debug(`Cache hit for ${fullPath}`);
+        return { ...cached, fromCache: true };
     }
 
     try {
-        Logger.debug(`Getting tags from database for ${cleanedId}`);
-        const fileData = await db.getWithMetadata(cleanedId);
+        Logger.debug(`Getting tags from database for:`, {
+            fullPath,
+            cleanedPath,
+            fileId,
+            originalPath: pathInfo.originalPath
+        });
+        
+        // 尝试用不同的路径格式查询
+        const pathsToTry = [
+            fullPath,          // file/img/KfONFGrt.webp
+            cleanedPath,       // img/KfONFGrt.webp
+            fileId,            // KfONFGrt.webp
+            pathInfo.originalPath // 原始输入
+        ];
+        
+        let fileData = null;
+        let foundPath = null;
+        for (const path of pathsToTry) {
+            if (!path) continue;
+            
+            try {
+                fileData = await db.getWithMetadata(path);
+                if (fileData) {
+                    foundPath = path;
+                    Logger.debug(`Found file with path: ${path}`);
+                    break;
+                }
+            } catch (error) {
+                Logger.debug(`Error trying path ${path}:`, error.message);
+            }
+        }
 
         if (!fileData) {
-            Logger.error(`File ${cleanedId} not found in database`);
+            Logger.error(`File not found in database. Tried paths: ${pathsToTry.filter(p => p).join(', ')}`);
             throw new Error('File not found');
         }
 
         if (!fileData.metadata) {
-            Logger.warn(`File ${cleanedId} has no metadata, initializing empty`);
+            Logger.warn(`File ${fullPath} has no metadata, initializing empty`);
             fileData.metadata = {};
         }
 
         const tags = fileData.metadata.Tags || [];
         const result = {
-            fileId: cleanedId,
-            originalFileId: fileId,
+            fullPath,
+            cleanedPath,
+            fileId,
+            originalPath: pathInfo.originalPath,
             tags,
             metadata: fileData.metadata,
-            fromCache: false
+            fromCache: false,
+            fileUrl: `https://${hostname}/${fullPath}`
         };
 
         CacheManager.set(cacheKey, result);
@@ -395,21 +472,45 @@ async function getFileTags(db, fileId, bypassCache = false) {
 /**
  * 更新文件标签
  */
-async function updateFileTags({ db, fileId, action, tags, options, context }) {
-    const cleanedId = cleanFileId(fileId);
+async function updateFileTags({ db, pathInfo, action, tags, options, context, hostname }) {
+    const { fullPath, cleanedPath, fileId } = pathInfo;
     const { waitUntil, env } = context;
 
     try {
-        Logger.debug(`Updating tags for ${cleanedId}:`, { action, tags, options });
-        const fileData = await db.getWithMetadata(cleanedId);
+        Logger.debug(`Updating tags for ${fullPath}:`, { action, tags, options });
+        
+        // 尝试用不同的路径格式查询
+        const pathsToTry = [
+            fullPath,          // file/img/KfONFGrt.webp
+            cleanedPath,       // img/KfONFGrt.webp
+            fileId,            // KfONFGrt.webp
+            pathInfo.originalPath // 原始输入
+        ];
+        
+        let fileData = null;
+        let foundPath = null;
+        for (const path of pathsToTry) {
+            if (!path) continue;
+            
+            try {
+                fileData = await db.getWithMetadata(path);
+                if (fileData) {
+                    foundPath = path;
+                    Logger.debug(`Found file with path: ${path}`);
+                    break;
+                }
+            } catch (error) {
+                Logger.debug(`Error trying path ${path}:`, error.message);
+            }
+        }
 
         if (!fileData) {
-            Logger.error(`File ${cleanedId} not found in database`);
+            Logger.error(`File not found in database. Tried paths: ${pathsToTry.filter(p => p).join(', ')}`);
             throw new Error('File not found');
         }
 
         if (!fileData.metadata) {
-            Logger.warn(`File ${cleanedId} has no metadata, creating new`);
+            Logger.warn(`File ${fullPath} has no metadata, creating new`);
             fileData.metadata = {};
         }
 
@@ -455,38 +556,45 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         const tagsChanged = JSON.stringify(existingTags.sort()) !== JSON.stringify(updatedTags.sort());
 
         if (!tagsChanged) {
-            Logger.debug(`No tag changes for ${cleanedId}`);
+            Logger.debug(`No tag changes for ${fullPath}`);
             return {
-                fileId: cleanedId,
-                originalFileId: fileId,
+                fullPath,
+                cleanedPath,
+                fileId,
+                originalPath: pathInfo.originalPath,
                 action,
                 tags: existingTags,
                 existingTags,
                 updatedTags,
                 changed: false,
-                metadata: fileData.metadata
+                metadata: fileData.metadata,
+                fileUrl: `https://${hostname}/${fullPath}`
             };
         }
 
         fileData.metadata.Tags = updatedTags;
         fileData.metadata.updatedAt = new Date().toISOString();
 
-        await db.put(cleanedId, fileData.value, {
+        // 使用找到的路径保存
+        await db.put(foundPath, fileData.value, {
             metadata: fileData.metadata
         });
 
-        CacheManager.clear(`tags:${cleanedId}`);
-        Logger.debug(`Tags updated for ${cleanedId}:`, updatedTags);
+        CacheManager.clear(`tags:${fullPath}`);
+        Logger.debug(`Tags updated for ${fullPath}:`, updatedTags);
 
         return {
-            fileId: cleanedId,
-            originalFileId: fileId,
+            fullPath,
+            cleanedPath,
+            fileId,
+            originalPath: pathInfo.originalPath,
             action,
             tags: updatedTags,
             existingTags,
             updatedTags,
             changed: true,
-            metadata: fileData.metadata
+            metadata: fileData.metadata,
+            fileUrl: `https://${hostname}/${fullPath}`
         };
 
     } catch (error) {
@@ -498,18 +606,21 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
 /**
  * 处理GET请求
  */
-async function handleGetTags(db, fileId) {
+async function handleGetTags(db, pathInfo, hostname) {
     try {
-        const result = await getFileTags(db, fileId);
+        const result = await getFileTags(db, pathInfo, hostname);
 
         return {
             status: 200,
             body: {
                 success: true,
+                fullPath: result.fullPath,
+                cleanedPath: result.cleanedPath,
                 fileId: result.fileId,
-                originalFileId: result.originalFileId,
+                originalPath: result.originalPath,
                 tags: result.tags,
                 fromCache: result.fromCache,
+                fileUrl: result.fileUrl,
                 timestamp: Date.now()
             }
         };
@@ -522,9 +633,18 @@ async function handleGetTags(db, fileId) {
                 status: 404,
                 body: {
                     error: 'File not found',
-                    fileId: cleanFileId(fileId),
-                    originalFileId: fileId,
+                    fullPath: pathInfo.fullPath,
+                    cleanedPath: pathInfo.cleanedPath,
+                    fileId: pathInfo.fileId,
+                    originalPath: pathInfo.originalPath,
+                    triedPaths: [
+                        pathInfo.fullPath,
+                        pathInfo.cleanedPath,
+                        pathInfo.fileId,
+                        pathInfo.originalPath
+                    ],
                     message: 'The requested file was not found in the database',
+                    fileUrl: `https://${hostname}/${pathInfo.fullPath}`,
                     timestamp: Date.now()
                 }
             };
@@ -545,7 +665,7 @@ async function handleGetTags(db, fileId) {
 /**
  * 处理POST请求
  */
-async function handlePostTags(context, db, fileId, hostname) {
+async function handlePostTags(context, db, pathInfo, hostname) {
     const { request, waitUntil } = context;
 
     try {
@@ -609,20 +729,24 @@ async function handlePostTags(context, db, fileId, hostname) {
         const { action, tags, options } = validation.params;
         const result = await updateFileTags({
             db,
-            fileId,
+            pathInfo,
             action,
             tags,
             options,
-            context
+            context,
+            hostname
         });
 
         if (result.changed) {
-            const cdnUrl = `https://${hostname}/file/${result.fileId}`;
-            waitUntil(purgeCFCache(context.env, cdnUrl).catch(err => 
+            // 使用当前请求的域名
+            const fileUrl = `https://${hostname}/${result.fullPath}`;
+            Logger.debug(`Purging CDN cache for: ${fileUrl}`);
+            
+            waitUntil(purgeCFCache(context.env, fileUrl).catch(err => 
                 Logger.error(`Cache purge error:`, err)
             ));
 
-            waitUntil(addFileToIndex(context, result.fileId, result.metadata).catch(err => 
+            waitUntil(addFileToIndex(context, result.fullPath, result.metadata).catch(err => 
                 Logger.error(`Index update error:`, err)
             ));
         }
@@ -631,13 +755,16 @@ async function handlePostTags(context, db, fileId, hostname) {
             status: 200,
             body: {
                 success: true,
+                fullPath: result.fullPath,
+                cleanedPath: result.cleanedPath,
                 fileId: result.fileId,
-                originalFileId: result.originalFileId,
+                originalPath: result.originalPath,
                 action: result.action,
                 tags: result.tags,
                 existingTags: result.existingTags,
                 updatedTags: result.updatedTags,
                 changed: result.changed,
+                fileUrl: result.fileUrl,
                 timestamp: Date.now()
             }
         };
@@ -650,9 +777,18 @@ async function handlePostTags(context, db, fileId, hostname) {
                 status: 404,
                 body: {
                     error: 'File not found',
-                    fileId: cleanFileId(fileId),
-                    originalFileId: fileId,
+                    fullPath: pathInfo.fullPath,
+                    cleanedPath: pathInfo.cleanedPath,
+                    fileId: pathInfo.fileId,
+                    originalPath: pathInfo.originalPath,
+                    triedPaths: [
+                        pathInfo.fullPath,
+                        pathInfo.cleanedPath,
+                        pathInfo.fileId,
+                        pathInfo.originalPath
+                    ],
                     message: 'The requested file was not found in the database',
+                    fileUrl: `https://${hostname}/${pathInfo.fullPath}`,
                     timestamp: Date.now()
                 }
             };
@@ -673,24 +809,27 @@ async function handlePostTags(context, db, fileId, hostname) {
 /**
  * 处理DELETE请求
  */
-async function handleDeleteTags(context, db, fileId, hostname) {
+async function handleDeleteTags(context, db, pathInfo, hostname) {
     try {
         const result = await updateFileTags({
             db,
-            fileId,
+            pathInfo,
             action: 'clear',
             tags: [],
             options: {},
-            context
+            context,
+            hostname
         });
 
         if (result.changed) {
-            const cdnUrl = `https://${hostname}/file/${result.fileId}`;
-            context.waitUntil(purgeCFCache(context.env, cdnUrl).catch(err => 
+            const fileUrl = `https://${hostname}/${result.fullPath}`;
+            Logger.debug(`Purging CDN cache for: ${fileUrl}`);
+            
+            context.waitUntil(purgeCFCache(context.env, fileUrl).catch(err => 
                 Logger.error(`Cache purge error:`, err)
             ));
 
-            context.waitUntil(addFileToIndex(context, result.fileId, result.metadata).catch(err => 
+            context.waitUntil(addFileToIndex(context, result.fullPath, result.metadata).catch(err => 
                 Logger.error(`Index update error:`, err)
             ));
         }
@@ -699,12 +838,15 @@ async function handleDeleteTags(context, db, fileId, hostname) {
             status: 200,
             body: {
                 success: true,
+                fullPath: result.fullPath,
+                cleanedPath: result.cleanedPath,
                 fileId: result.fileId,
-                originalFileId: result.originalFileId,
+                originalPath: result.originalPath,
                 action: 'clear',
                 tags: result.tags,
                 existingTags: result.existingTags,
                 changed: result.changed,
+                fileUrl: result.fileUrl,
                 timestamp: Date.now()
             }
         };
@@ -717,9 +859,18 @@ async function handleDeleteTags(context, db, fileId, hostname) {
                 status: 404,
                 body: {
                     error: 'File not found',
-                    fileId: cleanFileId(fileId),
-                    originalFileId: fileId,
+                    fullPath: pathInfo.fullPath,
+                    cleanedPath: pathInfo.cleanedPath,
+                    fileId: pathInfo.fileId,
+                    originalPath: pathInfo.originalPath,
+                    triedPaths: [
+                        pathInfo.fullPath,
+                        pathInfo.cleanedPath,
+                        pathInfo.fileId,
+                        pathInfo.originalPath
+                    ],
                     message: 'The requested file was not found in the database',
+                    fileUrl: `https://${hostname}/${pathInfo.fullPath}`,
                     timestamp: Date.now()
                 }
             };
@@ -767,7 +918,7 @@ export async function onRequest(context) {
         Logger.error('Failed to parse URL:', error);
     }
 
-    // Force debug mode for troubleshooting
+    // 强制调试模式
     CONFIG.DEBUG_MODE = true;
     
     Logger.log(`=== New Request ===`);
@@ -798,24 +949,37 @@ export async function onRequest(context) {
             });
         }
 
-        // Parse file ID from params
+        // 验证域名
+        if (!CONFIG.SUPPORTED_DOMAINS.includes(url.hostname)) {
+            Logger.error(`Unsupported domain: ${url.hostname}`);
+            return createResponse({
+                error: 'Unsupported domain',
+                message: `This API only supports domains: ${CONFIG.SUPPORTED_DOMAINS.join(', ')}`,
+                receivedDomain: url.hostname,
+                supportedDomains: CONFIG.SUPPORTED_DOMAINS,
+                timestamp: Date.now()
+            }, 403, corsHeaders);
+        }
+
+        // 解析和处理文件路径 - 关键修复
         let fileId = '';
         if (params.path) {
             fileId = String(params.path).split(',').join('/');
         }
-        fileId = decodeURIComponent(fileId || '');
-
-        Logger.debug(`Original file ID from request: "${fileId}"`);
-
-        // Validate file ID format
-        if (!validateFileId(fileId)) {
-            Logger.error(`Invalid file ID format: "${fileId}"`);
+        
+        // 处理文件路径
+        const pathInfo = processFilePath(fileId);
+        
+        // 验证文件路径格式
+        if (!validateFilePath(pathInfo.originalPath)) {
+            Logger.error(`Invalid file path format: "${pathInfo.originalPath}"`);
             return createResponse({
-                error: 'Invalid file ID',
-                message: 'File ID format is invalid',
-                fileId: fileId,
+                error: 'Invalid file path',
+                message: 'File path format is invalid',
+                originalPath: pathInfo.originalPath,
+                fullPath: pathInfo.fullPath,
                 validFormat: 'Should contain only letters, numbers, slashes, dots, underscores, and hyphens',
-                validExample: 'img/abc123def.jpg or abc123def.jpg',
+                validExample: 'img/KfONFGrt.webp or file/img/KfONFGrt.webp',
                 timestamp: Date.now()
             }, 400, corsHeaders);
         }
@@ -839,16 +1003,16 @@ export async function onRequest(context) {
         let response;
         switch (request.method) {
             case 'GET':
-                response = await handleGetTags(db, fileId);
+                response = await handleGetTags(db, pathInfo, url.hostname);
                 break;
                 
             case 'POST':
             case 'PATCH':
-                response = await handlePostTags(context, db, fileId, url.hostname);
+                response = await handlePostTags(context, db, pathInfo, url.hostname);
                 break;
                 
             case 'DELETE':
-                response = await handleDeleteTags(context, db, fileId, url.hostname);
+                response = await handleDeleteTags(context, db, pathInfo, url.hostname);
                 break;
                 
             default:
@@ -873,9 +1037,10 @@ export async function onRequest(context) {
         return createResponse(response.body, response.status, {
             ...corsHeaders,
             'X-Processing-Time': `${duration.toFixed(2)}ms`,
-            'X-API-Version': '1.3.0',
+            'X-API-Version': '1.5.0',
             'Cache-Control': response.status === 200 ? 'public, max-age=60' : 'no-store',
-            'X-Debug-Mode': CONFIG.DEBUG_MODE ? 'true' : 'false'
+            'X-Debug-Mode': CONFIG.DEBUG_MODE ? 'true' : 'false',
+            'X-Request-Host': url.hostname
         });
 
     } catch (error) {
@@ -902,9 +1067,10 @@ export async function onRequest(context) {
 /**
  * 清除标签缓存
  */
-export function clearTagCache(fileId) {
-    if (fileId) {
-        CacheManager.clear(`tags:${cleanFileId(fileId)}`);
+export function clearTagCache(filePath) {
+    if (filePath) {
+        const { fullPath } = processFilePath(filePath);
+        CacheManager.clear(`tags:${fullPath}`);
         return { success: true, cleared: 1 };
     }
     
