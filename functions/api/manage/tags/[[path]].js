@@ -1,12 +1,12 @@
 /**
- * Comprehensive Tag Management API Fix
+ * Enhanced Tag Management API with Debug Features
  * 
  * This version includes:
- * 1. Authentication handling
- * 2. Detailed error logging
+ * 1. Comprehensive error handling
+ * 2. Detailed debug logging
  * 3. Robust JSON response handling
- * 4. Path configuration validation
- * 5. Debug information
+ * 4. Input validation improvements
+ * 5. Better error messages
  */
 
 import { purgeCFCache } from "../../../utils/purgeCache.js";
@@ -23,9 +23,11 @@ const CONFIG = {
     MIN_TAG_LENGTH: 1,
     SUPPORTED_ACTIONS: ['set', 'add', 'remove', 'replace', 'toggle', 'clear'],
     ALLOWED_METHODS: ['GET', 'POST', 'DELETE', 'PATCH', 'OPTIONS'],
-    DEBUG_MODE: false, // Set to true for detailed logging
-    ALLOW_ANONYMOUS: false, // Set to true to allow anonymous access
-    ALLOWED_ORIGINS: ['https://hub.lsdns.top', 'https://curl.img.lsdns.top'] // Add your domains
+    DEBUG_MODE: true, // Force debug mode for troubleshooting
+    ALLOW_ANONYMOUS: false,
+    ALLOWED_ORIGINS: ['https://hub.lsdns.top', 'https://curl.img.lsdns.top'],
+    MAX_REQUEST_SIZE: 1024 * 1024, // 1MB
+    REQUEST_TIMEOUT: 30000 // 30 seconds
 };
 
 /**
@@ -39,18 +41,20 @@ function safeStringify(obj) {
             if (value instanceof Error) {
                 return {
                     message: value.message,
-                    stack: CONFIG.DEBUG_MODE ? value.stack : undefined
+                    stack: CONFIG.DEBUG_MODE ? value.stack : undefined,
+                    name: value.name
                 };
             }
             return value;
-        });
+        }, CONFIG.DEBUG_MODE ? 2 : 0);
     } catch (error) {
         console.error('JSON serialization error:', error);
         return JSON.stringify({
             error: 'Serialization error',
             message: 'Failed to serialize response',
-            details: CONFIG.DEBUG_MODE ? error.message : undefined
-        });
+            details: CONFIG.DEBUG_MODE ? error.message : undefined,
+            timestamp: Date.now()
+        }, null, 2);
     }
 }
 
@@ -73,10 +77,13 @@ const CacheManager = {
     set(key, data, ttl = CONFIG.CACHE_TTL) {
         this.cache.set(key, {
             data,
-            expires: Date.now() + (ttl * 1000)
+            expires: Date.now() + (ttl * 1000),
+            timestamp: Date.now()
         });
         if (this.cache.size > 1000) {
-            this.cache.delete(this.cache.keys().next().value);
+            const oldestKey = Array.from(this.cache.entries())
+                .sort((a, b) => a[1].timestamp - b[1].timestamp)[0][0];
+            this.cache.delete(oldestKey);
         }
     },
     
@@ -90,17 +97,21 @@ const CacheManager = {
  */
 const Logger = {
     log(...args) {
-        if (CONFIG.DEBUG_MODE) {
-            console.log('[Tag API]', ...args);
-        }
+        console.log('[Tag API]', new Date().toISOString(), ...args);
     },
     
     error(...args) {
-        console.error('[Tag API ERROR]', ...args);
+        console.error('[Tag API ERROR]', new Date().toISOString(), ...args);
     },
     
     warn(...args) {
-        console.warn('[Tag API WARN]', ...args);
+        console.warn('[Tag API WARN]', new Date().toISOString(), ...args);
+    },
+    
+    debug(...args) {
+        if (CONFIG.DEBUG_MODE) {
+            console.debug('[Tag API DEBUG]', new Date().toISOString(), ...args);
+        }
     }
 };
 
@@ -116,9 +127,11 @@ function cleanFileId(fileId) {
         .replace(/^uploads\//i, '')
         .replace(/^images\//i, '')
         .replace(/^\//, '')
-        .replace(/\?.*/, ''); // Remove query parameters
+        .replace(/\?.*/, '')
+        .replace(/\/+/g, '/')
+        .trim();
     
-    Logger.log(`File ID cleaned: "${fileId}" -> "${cleaned}"`);
+    Logger.debug(`File ID cleaned: "${fileId}" -> "${cleaned}"`);
     return cleaned;
 }
 
@@ -139,7 +152,7 @@ function validateFileId(fileId) {
  */
 function validateAuth(request, env) {
     if (CONFIG.ALLOW_ANONYMOUS) {
-        Logger.log('Anonymous access allowed');
+        Logger.debug('Anonymous access allowed');
         return { valid: true };
     }
     
@@ -148,9 +161,10 @@ function validateAuth(request, env) {
     if (authHeader) {
         const token = authHeader.replace(/^Bearer\s+/i, '');
         if (token && token === env.API_TOKEN) {
-            Logger.log('API token authentication successful');
+            Logger.debug('API token authentication successful');
             return { valid: true };
         }
+        Logger.debug('Invalid API token');
     }
     
     // Check cookie authentication
@@ -158,12 +172,13 @@ function validateAuth(request, env) {
     if (cookieHeader && cookieHeader.includes('auth_token=')) {
         const tokenMatch = cookieHeader.match(/auth_token=([^;]+)/);
         if (tokenMatch && tokenMatch[1] === env.AUTH_TOKEN) {
-            Logger.log('Cookie authentication successful');
+            Logger.debug('Cookie authentication successful');
             return { valid: true };
         }
+        Logger.debug('Invalid cookie token');
     }
     
-    Logger.error('Authentication failed');
+    Logger.error('Authentication failed - no valid credentials provided');
     return {
         valid: false,
         error: 'Unauthorized',
@@ -181,13 +196,13 @@ function handleCORS(request) {
     const headers = {
         'Access-Control-Allow-Origin': allowedOrigin,
         'Access-Control-Allow-Methods': CONFIG.ALLOWED_METHODS.join(', '),
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, X-Debug',
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Max-Age': '86400'
     };
 
     if (request.method === 'OPTIONS') {
-        Logger.log('Handling OPTIONS preflight request');
+        Logger.debug('Handling OPTIONS preflight request');
         return new Response(null, { 
             status: 204, 
             headers 
@@ -201,11 +216,14 @@ function handleCORS(request) {
  * 验证标签请求
  */
 function validateTagRequest(requestBody) {
+    Logger.debug('Validating tag request:', requestBody);
+    
     if (!requestBody || typeof requestBody !== 'object') {
         return {
             valid: false,
             error: 'Invalid request',
-            message: 'Request body must be a JSON object'
+            message: 'Request body must be a JSON object',
+            details: 'Request body is not a valid JSON object'
         };
     }
 
@@ -215,7 +233,8 @@ function validateTagRequest(requestBody) {
         return {
             valid: false,
             error: 'Invalid action',
-            message: `Action must be one of: ${CONFIG.SUPPORTED_ACTIONS.join(', ')}`
+            message: `Action must be one of: ${CONFIG.SUPPORTED_ACTIONS.join(', ')}`,
+            details: `Received action: ${action}`
         };
     }
 
@@ -223,7 +242,8 @@ function validateTagRequest(requestBody) {
         return {
             valid: false,
             error: 'Invalid tags',
-            message: 'Tags must be a non-empty array'
+            message: 'Tags must be a non-empty array',
+            details: `Received tags: ${JSON.stringify(tags)}`
         };
     }
 
@@ -281,8 +301,9 @@ function validateTags(tags, options) {
         return {
             valid: false,
             error: 'Invalid tag format',
-            message: `Tags must be ${CONFIG.MIN_TAG_LENGTH}-${CONFIG.MAX_TAG_LENGTH} characters`,
-            invalidTags
+            message: `Tags must be ${CONFIG.MIN_TAG_LENGTH}-${CONFIG.MAX_TAG_LENGTH} characters and contain only valid characters`,
+            invalidTags,
+            details: `Invalid tags: ${invalidTags.join(', ')}`
         };
     }
 
@@ -290,8 +311,9 @@ function validateTags(tags, options) {
         return {
             valid: false,
             error: 'Duplicate tags',
-            message: 'Duplicate tags found',
-            duplicateTags
+            message: 'Duplicate tags found in request',
+            duplicateTags,
+            details: `Duplicate tags: ${duplicateTags.join(', ')}`
         };
     }
 
@@ -333,13 +355,13 @@ async function getFileTags(db, fileId, bypassCache = false) {
     if (!bypassCache) {
         const cached = CacheManager.get(cacheKey);
         if (cached) {
-            Logger.log(`Cache hit for ${cleanedId}`);
+            Logger.debug(`Cache hit for ${cleanedId}`);
             return { ...cached, fromCache: true };
         }
     }
 
     try {
-        Logger.log(`Getting tags from database for ${cleanedId}`);
+        Logger.debug(`Getting tags from database for ${cleanedId}`);
         const fileData = await db.getWithMetadata(cleanedId);
 
         if (!fileData) {
@@ -378,7 +400,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
     const { waitUntil, env } = context;
 
     try {
-        Logger.log(`Updating tags for ${cleanedId}:`, { action, tags, options });
+        Logger.debug(`Updating tags for ${cleanedId}:`, { action, tags, options });
         const fileData = await db.getWithMetadata(cleanedId);
 
         if (!fileData) {
@@ -433,7 +455,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         const tagsChanged = JSON.stringify(existingTags.sort()) !== JSON.stringify(updatedTags.sort());
 
         if (!tagsChanged) {
-            Logger.log(`No tag changes for ${cleanedId}`);
+            Logger.debug(`No tag changes for ${cleanedId}`);
             return {
                 fileId: cleanedId,
                 originalFileId: fileId,
@@ -454,7 +476,7 @@ async function updateFileTags({ db, fileId, action, tags, options, context }) {
         });
 
         CacheManager.clear(`tags:${cleanedId}`);
-        Logger.log(`Tags updated for ${cleanedId}:`, updatedTags);
+        Logger.debug(`Tags updated for ${cleanedId}:`, updatedTags);
 
         return {
             fileId: cleanedId,
@@ -536,6 +558,7 @@ async function handlePostTags(context, db, fileId, hostname) {
                     error: 'Unsupported media type',
                     message: 'Request must be JSON',
                     receivedType: contentType,
+                    expectedType: 'application/json',
                     timestamp: Date.now()
                 }
             };
@@ -544,14 +567,14 @@ async function handlePostTags(context, db, fileId, hostname) {
         let body;
         try {
             const bodyText = await request.text();
-            Logger.log('Request body text:', bodyText);
+            Logger.debug('Request body text:', bodyText);
             
             if (!bodyText.trim()) {
                 throw new Error('Empty request body');
             }
             
             body = JSON.parse(bodyText);
-            Logger.log('Parsed request body:', body);
+            Logger.debug('Parsed request body:', body);
 
         } catch (error) {
             Logger.error('JSON parse error:', error);
@@ -571,12 +594,13 @@ async function handlePostTags(context, db, fileId, hostname) {
         if (!validation.valid) {
             Logger.error('Request validation failed:', validation);
             return {
-                status: 400,
+                status: validation.status || 400,
                 body: {
                     error: validation.error,
                     message: validation.message,
                     ...(validation.invalidTags && { invalidTags: validation.invalidTags }),
                     ...(validation.duplicateTags && { duplicateTags: validation.duplicateTags }),
+                    ...(validation.details && { details: validation.details }),
                     timestamp: Date.now()
                 }
             };
@@ -714,15 +738,37 @@ async function handleDeleteTags(context, db, fileId, hostname) {
 }
 
 /**
+ * 创建响应
+ */
+function createResponse(body, status = 200, headers = {}) {
+    return new Response(safeStringify(body), {
+        status,
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Content-Type-Options': 'nosniff',
+            'X-XSS-Protection': '1; mode=block',
+            ...headers
+        }
+    });
+}
+
+/**
  * 主API处理函数
  */
 export async function onRequest(context) {
     const startTime = performance.now();
     const { request, env, params } = context;
-    const url = new URL(request.url);
+    let url;
+    
+    try {
+        url = new URL(request.url);
+    } catch (error) {
+        url = new URL('https://example.com');
+        Logger.error('Failed to parse URL:', error);
+    }
 
-    // Set debug mode from environment variable
-    CONFIG.DEBUG_MODE = env.DEBUG_MODE === 'true' || CONFIG.DEBUG_MODE;
+    // Force debug mode for troubleshooting
+    CONFIG.DEBUG_MODE = true;
     
     Logger.log(`=== New Request ===`);
     Logger.log(`Method: ${request.method}`);
@@ -730,6 +776,7 @@ export async function onRequest(context) {
     Logger.log(`Hostname: ${url.hostname}`);
     Logger.log(`Path: ${url.pathname}`);
     Logger.log(`Params:`, params);
+    Logger.log(`Headers:`, Object.fromEntries(request.headers));
 
     try {
         // Handle CORS first
@@ -741,17 +788,13 @@ export async function onRequest(context) {
         // Validate authentication
         const authResult = validateAuth(request, env);
         if (!authResult.valid) {
-            return new Response(safeStringify({
+            return createResponse({
                 error: authResult.error,
                 message: authResult.message,
                 timestamp: Date.now()
-            }), {
-                status: 401,
-                headers: {
-                    ...corsHeaders,
-                    'Content-Type': 'application/json',
-                    'WWW-Authenticate': 'Bearer'
-                }
+            }, 401, {
+                ...corsHeaders,
+                'WWW-Authenticate': 'Bearer'
             });
         }
 
@@ -762,45 +805,34 @@ export async function onRequest(context) {
         }
         fileId = decodeURIComponent(fileId || '');
 
-        Logger.log(`Original file ID from request: "${fileId}"`);
+        Logger.debug(`Original file ID from request: "${fileId}"`);
 
         // Validate file ID format
         if (!validateFileId(fileId)) {
             Logger.error(`Invalid file ID format: "${fileId}"`);
-            return new Response(safeStringify({
+            return createResponse({
                 error: 'Invalid file ID',
                 message: 'File ID format is invalid',
                 fileId: fileId,
                 validFormat: 'Should contain only letters, numbers, slashes, dots, underscores, and hyphens',
+                validExample: 'img/abc123def.jpg or abc123def.jpg',
                 timestamp: Date.now()
-            }), {
-                status: 400,
-                headers: { 
-                    ...corsHeaders,
-                    'Content-Type': 'application/json'
-                }
-            });
+            }, 400, corsHeaders);
         }
 
         // Check if database is available
         let db;
         try {
             db = getDatabase(env);
-            Logger.log('Database connection established');
+            Logger.debug('Database connection established');
         } catch (dbError) {
             Logger.error('Database connection error:', dbError);
-            return new Response(safeStringify({
+            return createResponse({
                 error: 'Database error',
                 message: 'Failed to connect to database',
                 details: CONFIG.DEBUG_MODE ? dbError.message : undefined,
                 timestamp: Date.now()
-            }), {
-                status: 503,
-                headers: { 
-                    ...corsHeaders,
-                    'Content-Type': 'application/json'
-                }
-            });
+            }, 503, corsHeaders);
         }
 
         // Route request
@@ -838,15 +870,12 @@ export async function onRequest(context) {
         Logger.log(`Body:`, response.body);
 
         // Send response
-        return new Response(safeStringify(response.body), {
-            status: response.status,
-            headers: {
-                ...corsHeaders,
-                'Content-Type': 'application/json',
-                'X-Processing-Time': `${duration.toFixed(2)}ms`,
-                'X-API-Version': '1.2.0',
-                'Cache-Control': response.status === 200 ? 'public, max-age=60' : 'no-store'
-            }
+        return createResponse(response.body, response.status, {
+            ...corsHeaders,
+            'X-Processing-Time': `${duration.toFixed(2)}ms`,
+            'X-API-Version': '1.3.0',
+            'Cache-Control': response.status === 200 ? 'public, max-age=60' : 'no-store',
+            'X-Debug-Mode': CONFIG.DEBUG_MODE ? 'true' : 'false'
         });
 
     } catch (error) {
@@ -856,20 +885,16 @@ export async function onRequest(context) {
         Logger.error(`Stack:`, error.stack);
 
         // Send error response
-        return new Response(safeStringify({
+        return createResponse({
             error: 'Internal server error',
             message: 'An unexpected error occurred',
             details: CONFIG.DEBUG_MODE ? error.message : undefined,
             stack: CONFIG.DEBUG_MODE ? error.stack : undefined,
             processingTime: `${duration.toFixed(2)}ms`,
             timestamp: Date.now()
-        }), {
-            status: 500,
-            headers: {
-                ...handleCORS(request),
-                'Content-Type': 'application/json',
-                'Cache-Control': 'no-store'
-            }
+        }, 500, {
+            ...handleCORS(request),
+            'Cache-Control': 'no-store'
         });
     }
 }
